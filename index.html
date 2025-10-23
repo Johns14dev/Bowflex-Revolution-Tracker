@@ -1,0 +1,2674 @@
+import React, { useState, useEffect, useReducer, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, doc, setDoc, getDocs, deleteDoc, onSnapshot, query, where, serverTimestamp } from 'firebase/firestore';
+import { RefreshCw, Play, Pause, Square, Dumbbell, Clock, Plus, Trash2, List, Settings, Home, History, Info, Youtube, Award, Video, User, Ruler, Zap } from 'lucide-react';
+
+// --- LLM TOOLS (Integrated from llm_tools.js) ---
+
+const API_KEY = ""; 
+// Use gemini-2.5-flash-preview-09-2025 as instructed
+const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${API_KEY}`;
+
+// Helper function for exponential backoff (retry logic)
+const withBackoff = async (apiCall, maxRetries = 5) => {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            return await apiCall();
+        } catch (error) {
+            if (attempt === maxRetries - 1) {
+                console.error("LLM call failed after all retries:", error);
+                throw new Error("Could not connect to AI service. Please try again later.");
+            }
+            // Wait for 2^attempt seconds
+            const delay = Math.pow(2, attempt) * 1000;
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+};
+
+/**
+ * Calls the Gemini API to get a fitness critique and suggested improvements for a workout.
+ * @param {object} workoutData - The workout object to be critiqued.
+ * @returns {Promise<string>} - The generated critique text.
+ */
+async function getWorkoutCritique(workoutData) {
+    const workoutDetails = JSON.stringify({
+        name: workoutData.name,
+        totalExercises: workoutData.exercises.length,
+        exercises: workoutData.exercises.map(ex => ({
+            name: ex.name,
+            group: ex.group,
+            sets: ex.sets.map(s => `Sets: ${s.targetReps}, Lbs: ${s.targetResistance}`).join(' / ')
+        }))
+    }, null, 2);
+
+    const systemPrompt = `You are a certified Strength and Conditioning Coach specialized in the Bowflex Revolution home gym. 
+    Your goal is to provide constructive feedback on the user's custom workout plan.
+    1. Assess the balance across major muscle groups (Push, Pull, Legs, Core).
+    2. Check the intensity (Sets x Reps x Resistance) for consistency.
+    3. Suggest one specific, actionable improvement (e.g., "Add a heavy pulling movement" or "Reduce volume on chest").
+    
+    Format the response as a single, friendly paragraph, addressing the user directly. Do not use markdown headers or bullet points.`;
+
+    const userQuery = `Analyze the following workout plan, designed for the Bowflex Revolution. Provide a critique and suggestion: \n\n${workoutDetails}`;
+    
+    const payload = {
+        contents: [{ parts: [{ text: userQuery }] }],
+        systemInstruction: {
+            parts: [{ text: systemPrompt }]
+        },
+        config: {
+            temperature: 0.7
+        }
+    };
+
+    return withBackoff(async () => {
+        const response = await fetch(API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const result = await response.json();
+        
+        const critique = result.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!critique) throw new Error("AI returned no content.");
+        return critique;
+    });
+}
+
+/**
+ * Calls the Gemini API to generate a personalized performance review for a single logged workout.
+ * @param {object} logData - The logged workout data.
+ * @param {string} unitSystem - The user's preferred unit system ('imperial' or 'metric').
+ * @returns {Promise<string>} - The generated performance summary text.
+ */
+async function getPerformanceReview(logData, unitSystem) {
+    const isMetric = unitSystem === 'metric';
+    const resistanceUnit = isMetric ? 'Kg' : 'Lbs';
+
+    // Conversion functions (Resistance is approximate conversion based on 1 Lb = 0.453592 Kg)
+    const LBS_TO_KG = (lbs) => Math.round(lbs * 0.453592);
+
+    // Convert all resistance values in logData to user's unit system for accurate review
+    const exercisesForReview = logData.exercisesLogged.map(ex => {
+        return {
+            name: ex.name,
+            sets: ex.sets.map(set => ({
+                reps: set.reps,
+                resistance: isMetric ? LBS_TO_KG(set.resistance) : set.resistance, // Convert Lbs to Kg for metric user review
+                targetReps: set.targetReps,
+                targetResistance: isMetric ? LBS_TO_KG(set.targetResistance) : set.targetResistance
+            }))
+        };
+    });
+
+    const systemPrompt = `You are an encouraging and insightful Personal Trainer who just reviewed a client's workout log on the Bowflex Revolution.
+    1. Write a brief, personalized summary (1-3 sentences) of their performance, mentioning the workout name and duration.
+    2. Identify one area of strength (e.g., consistency, a max lift, or hitting all rep targets).
+    3. Identify one area for improvement or focus for the next session (e.g., increasing load on a specific exercise, maintaining target reps on another).
+    
+    Ensure the review is in a single paragraph, is motivational, and uses the unit system provided (${resistanceUnit}). Do not use markdown headers or bullet points.`;
+
+    const userQuery = `Review the following workout log. Unit System: ${resistanceUnit}.
+    Workout Name: ${logData.workoutName}
+    Duration: ${logData.durationMinutes} minutes
+    Exercises Logged: ${JSON.stringify(exercisesForReview, null, 2)}`;
+
+    const payload = {
+        contents: [{ parts: [{ text: userQuery }] }],
+        systemInstruction: {
+            parts: [{ text: systemPrompt }]
+        },
+        config: {
+            temperature: 0.8
+        }
+    };
+
+    return withBackoff(async () => {
+        const response = await fetch(API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const result = await response.json();
+        
+        const review = result.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!review) throw new Error("AI returned no content.");
+        return review;
+    });
+}
+// --- END LLM TOOLS ---
+
+
+// --- Global Constants and Utilities ---
+const APP_ID = typeof __app_id !== 'undefined' ? __app_id : 'default-bowflex-app';
+const FIREBASE_CONFIG = typeof __firebase_config !== 'undefined' ? __firebase_config : null;
+const INITIAL_AUTH_TOKEN = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// YouTube Video Constants (Source: https://www.youtube.com/watch?v=dejv7FGagB4)
+const YOUTUBE_VIDEO_ID = 'dejv7FGagB4';
+const YOUTUBE_BASE_URL = `http://www.youtube.com/watch?v=${YOUTUBE_VIDEO_ID}`;
+
+// Helper to generate timestamped YouTube link
+const getYoutubeLink = (seconds) => `${YOUTUBE_BASE_URL}&t=${seconds}s`;
+
+// Configuration for Exercise Setup Dropdowns
+const ARM_POSITIONS = Array.from({ length: 10 }, (_, i) => i); // 0 to 9
+const BENCH_POSITIONS = ['Removed', 'Flat', '45° Incline', 'Leg Extension Seat', 'Sliding Seat'];
+
+// Conversion functions (Resistance is approximate conversion based on 1 Lb = 0.453592 Kg)
+const LBS_TO_KG = (lbs) => Math.round(lbs * 0.453592);
+const KG_TO_LBS = (kg) => Math.round(kg / 0.453592);
+
+const convertResistance = (value, unitSystem) => {
+  const num = parseInt(value) || 0;
+  if (unitSystem === 'metric') {
+    // Treat the stored number as Lbs and convert to Kg for display
+    return LBS_TO_KG(num);
+  }
+  // If imperial, return the stored number (which is in Lbs)
+  return num;
+};
+
+// --- Achievement Goals ---
+const ACHIEVEMENT_GOALS = [
+  // Consistency
+  { id: 'first_workout', name: 'First Revolution', category: 'Consistency', description: 'Log 1 complete workout session.', check: (stats) => stats.totalWorkouts >= 1 },
+  { id: 'rookie_streak', name: 'Rookie Streak', category: 'Consistency', description: 'Log 3 complete workout sessions.', check: (stats) => stats.totalWorkouts >= 3 },
+  { id: 'dedicated_user', name: 'Dedicated User', category: 'Consistency', description: 'Log 10 complete workout sessions.', check: (stats) => stats.totalWorkouts >= 10 },
+  // Volume
+  { id: 'rep_starter', name: 'Rep Starter', category: 'Volume', description: 'Achieve a total of 500 logged repetitions.', check: (stats) => stats.totalReps >= 500 },
+  { id: 'rep_warrior', name: 'Rep Warrior', category: 'Volume', description: 'Achieve a total of 2,500 logged repetitions.', check: (stats) => stats.totalReps >= 2500 },
+  // Strength (Goals are set in Lbs, conversion handled in rendering)
+  { id: 'leg_master', name: 'Leg Day Master', category: 'Strength', description: 'Log a Leg Press set of 150 Lbs or more.', check: (stats) => stats.maxLegPress >= 150 },
+  { id: 'upper_beast', name: 'Upper Body Beast', category: 'Strength', description: 'Log a Bench Press set of 100 Lbs or more.', check: (stats) => stats.maxBenchPress >= 100 },
+];
+
+// Expanded list based on Bowflex Revolution Owner's Manual (Pages 30-81)
+const BOWFLEX_EXERCISES = [
+  // Chest
+  { group: 'Chest', name: 'Bench Press' },
+  { group: 'Chest', name: 'Incline Chest Press' },
+  { group: 'Chest', name: 'Decline Chest Press' },
+  { group: 'Chest', name: 'Chest Fly' },
+  { group: 'Chest', name: 'Incline Chest Fly' },
+  { group: 'Chest', name: 'Decline Chest Fly' },
+  { group: 'Chest', name: 'Standing Chest Press' },
+  { group: 'Chest', name: 'Lying Cable Crossover' },
+  // Back
+  { group: 'Back', name: 'Seated Lat Row' },
+  { group: 'Back', name: 'Rear Delt Row' }, // Row variants
+  { group: 'Back', name: 'Narrow Pulldown w/ Hand Grips' },
+  { group: 'Back', name: 'Stiff Arm Pulldown' },
+  { group: 'Back', name: 'Lying Lat Fly' },
+  { group: 'Back', name: 'Lying Shoulder Pullover' },
+  // Shoulders
+  { group: 'Shoulders', name: 'Seated Shoulder Press' },
+  { group: 'Shoulders', name: 'Standing Lateral Shoulder Raise' },
+  { group: 'Shoulders', name: 'Front Shoulder Raise' },
+  { group: 'Shoulders', name: 'Shoulder Shrug' },
+  { group: 'Shoulders', name: 'Rear Delt Row' },
+  { group: 'Shoulders', name: 'Reverse Fly Cable Cross' },
+  { group: 'Shoulders', name: 'Shoulder Internal Rotation' },
+  { group: 'Shoulders', name: 'Shoulder External Rotation' },
+  // Arms
+  { group: 'Arms', name: 'Standing Biceps Curl' },
+  { group: 'Arms', name: 'Standing Hammer Grip Curls' },
+  { group: 'Arms', name: 'French Press (Overhead Triceps)' },
+  { group: 'Arms', name: 'Triceps Pushdown' },
+  { group: 'Arms', name: 'Lying Triceps Press' },
+  { group: 'Arms', name: 'Tricep Kickback' },
+  { group: 'Arms', name: 'Reverse Curl' },
+  { group: 'Arms', name: 'Seated Wrist Curl' },
+  { group: 'Arms', name: 'Seated Wrist Extension' },
+  // Legs
+  { group: 'Legs', name: 'Leg Press' },
+  { group: 'Legs', name: 'Leg Extension' },
+  { group: 'Legs', name: 'Prone (Lying) Leg Curl' },
+  { group: 'Legs', name: 'Calf Raise on Leg Press' },
+  { group: 'Legs', name: 'Standing Leg Kickback' },
+  { group: 'Legs', name: 'Standing Hip Extension (Knee Flexed)' },
+  { group: 'Legs', name: 'Hip Abduction' },
+  { group: 'Legs', name: 'Hip Adduction' },
+  // Core
+  { group: 'Core', name: 'Resisted Abdominal Crunch' },
+  { group: 'Core', name: 'Seated (Resisted) Oblique Crunch' },
+  { group: 'Core', name: 'Seated Low Back Extension' },
+  { group: 'Core', name: 'Standing Trunk Rotation' },
+  { group: 'Core', name: 'Reverse Crunch' },
+];
+
+// Sample workouts based on the Owner's Manual (Pages 23 & 28)
+const SAMPLE_WORKOUTS = [
+  // --- BEGINNER ---
+  {
+    id: 'sample-better-body',
+    name: '20 Minute Better Body Workout',
+    level: 'Beginner',
+    description: '3 Days/Wk. (M-W-F). Focus: 10-15 Reps, 1-2 Sets. (P. 23)',
+    exercises: [
+      { group: 'Back', name: 'Seated Lat Row', armPosition: 9, benchPosition: 'Flat', sets: [{ targetReps: 12, targetResistance: 60 }, { targetReps: 12, targetResistance: 60 }] },
+      { group: 'Shoulders', name: 'Rear Delt Row', armPosition: 6, benchPosition: 'Flat', sets: [{ targetReps: 12, targetResistance: 40 }, { targetReps: 12, targetResistance: 40 }] },
+      { group: 'Arms', name: 'Lying Triceps Press', armPosition: 9, benchPosition: 'Flat', sets: [{ targetReps: 12, targetResistance: 50 }, { targetReps: 12, targetResistance: 50 }] },
+      { group: 'Arms', name: 'Standing Biceps Curl', armPosition: 8, benchPosition: 'Removed', sets: [{ targetReps: 12, targetResistance: 40 }, { targetReps: 12, targetResistance: 40 }] },
+      { group: 'Core', name: 'Seated Low Back Extension', armPosition: 8, benchPosition: 'Sliding Seat', sets: [{ targetReps: 12, targetResistance: 40 }, { targetReps: 12, targetResistance: 40 }] },
+      { group: 'Core', name: 'Resisted Abdominal Crunch', armPosition: 8, benchPosition: '45° Incline', sets: [{ targetReps: 12, targetResistance: 40 }, { targetReps: 12, targetResistance: 40 }] },
+      { group: 'Chest', name: 'Bench Press', armPosition: 8, benchPosition: '45° Incline', sets: [{ targetReps: 12, targetResistance: 70 }, { targetReps: 12, targetResistance: 70 }] },
+      { group: 'Legs', name: 'Leg Extension', armPosition: 9, benchPosition: 'Leg Extension Seat', sets: [{ targetReps: 12, targetResistance: 60 }, { targetReps: 12, targetResistance: 60 }] },
+      { group: 'Legs', name: 'Prone (Lying) Leg Curl', armPosition: 9, benchPosition: 'Flat', sets: [{ targetReps: 12, targetResistance: 50 }, { targetReps: 12, targetResistance: 50 }] },
+    ]
+  },
+  {
+    id: 'sample-upper-lower-1-3',
+    name: '20 Min Upper/Lower (Day 1 & 3)',
+    level: 'Beginner',
+    description: '4 Days/Wk. Split. Focus: 12-15 Reps, 1-3 Sets (Upper). (P. 24)',
+    exercises: [
+      { group: 'Chest', name: 'Bench Press', armPosition: 8, benchPosition: '45° Incline', sets: [{ targetReps: 14, targetResistance: 60 }, { targetReps: 14, targetResistance: 60 }] },
+      { group: 'Back', name: 'Seated Lat Row', armPosition: 9, benchPosition: 'Flat', sets: [{ targetReps: 14, targetResistance: 60 }, { targetReps: 14, targetResistance: 60 }] },
+      { group: 'Shoulders', name: 'Seated Shoulder Press', armPosition: 7, benchPosition: 'Flat', sets: [{ targetReps: 14, targetResistance: 50 }, { targetReps: 14, targetResistance: 50 }] },
+      { group: 'Arms', name: 'French Press (Overhead Triceps)', armPosition: 9, benchPosition: 'Flat', sets: [{ targetReps: 14, targetResistance: 30 }, { targetReps: 14, targetResistance: 30 }] },
+      { group: 'Arms', name: 'Standing Biceps Curl', armPosition: 8, benchPosition: 'Removed', sets: [{ targetReps: 14, targetResistance: 40 }, { targetReps: 14, targetResistance: 40 }] },
+    ]
+  },
+  {
+    id: 'sample-upper-lower-2-4',
+    name: '20 Min Upper/Lower (Day 2 & 4)',
+    level: 'Beginner',
+    description: '4 Days/Wk. Split. Focus: 12-15 Reps, 1-3 Sets (Lower). (P. 24)',
+    exercises: [
+      { group: 'Legs', name: 'Leg Extension', armPosition: 9, benchPosition: 'Leg Extension Seat', sets: [{ targetReps: 14, targetResistance: 60 }, { targetReps: 14, targetResistance: 60 }] },
+      { group: 'Legs', name: 'Prone (Lying) Leg Curl', armPosition: 9, benchPosition: 'Flat', sets: [{ targetReps: 14, targetResistance: 50 }, { targetReps: 14, targetResistance: 50 }] },
+      { group: 'Legs', name: 'Leg Press', armPosition: 9, benchPosition: 'Sliding Seat', sets: [{ targetReps: 14, targetResistance: 80 }, { targetReps: 14, targetResistance: 80 }] },
+      { group: 'Legs', name: 'Calf Raise on Leg Press', armPosition: 9, benchPosition: 'Sliding Seat', sets: [{ targetReps: 14, targetResistance: 60 }, { targetReps: 14, targetResistance: 60 }] },
+      { group: 'Core', name: 'Seated Low Back Extension', armPosition: 8, benchPosition: 'Sliding Seat', sets: [{ targetReps: 12, targetResistance: 40 }, { targetReps: 12, targetResistance: 40 }] },
+      { group: 'Core', name: 'Resisted Abdominal Crunch', armPosition: 8, benchPosition: '45° Incline', sets: [{ targetReps: 12, targetResistance: 40 }, { targetReps: 12, targetResistance: 40 }] },
+    ]
+  },
+  // --- INTERMEDIATE ---
+  {
+    id: 'sample-advanced-gen-cond-1-3',
+    name: 'Advanced Gen. Cond. (Day 1 & 3)',
+    level: 'Intermediate',
+    description: '4 Days/Wk. Split. Focus: 10-12 Reps, 3 Sets. (P. 23)',
+    exercises: [
+      { group: 'Chest', name: 'Standing Chest Press', armPosition: 4, benchPosition: 'Removed', sets: [{ targetReps: 10, targetResistance: 60 }, { targetReps: 10, targetResistance: 60 }, { targetReps: 10, targetResistance: 60 }] },
+      { group: 'Shoulders', name: 'Seated Shoulder Press', armPosition: 7, benchPosition: 'Flat', sets: [{ targetReps: 10, targetResistance: 50 }, { targetReps: 10, targetResistance: 50 }, { targetReps: 10, targetResistance: 50 }] },
+      { group: 'Arms', name: 'Triceps Pushdown', armPosition: 0, benchPosition: 'Removed', sets: [{ targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 40 }] },
+      { group: 'Arms', name: 'French Press (Overhead Triceps)', armPosition: 9, benchPosition: 'Flat', sets: [{ targetReps: 10, targetResistance: 30 }, { targetReps: 10, targetResistance: 30 }, { targetReps: 10, targetResistance: 30 }] },
+      { group: 'Legs', name: 'Leg Press', armPosition: 9, benchPosition: 'Sliding Seat', sets: [{ targetReps: 10, targetResistance: 80 }, { targetReps: 10, targetResistance: 80 }, { targetReps: 10, targetResistance: 80 }] },
+      { group: 'Legs', name: 'Calf Raise on Leg Press', armPosition: 9, benchPosition: 'Sliding Seat', sets: [{ targetReps: 12, targetResistance: 60 }, { targetReps: 12, targetResistance: 60 }, { targetReps: 12, targetResistance: 60 }] },
+    ]
+  },
+  {
+    id: 'sample-advanced-gen-cond-2-4',
+    name: 'Advanced Gen. Cond. (Day 2 & 4)',
+    level: 'Intermediate',
+    description: '4 Days/Wk. Split. Focus: 10-12 Reps, 3 Sets. (P. 23)',
+    exercises: [
+      { group: 'Back', name: 'Seated Lat Row', armPosition: 9, benchPosition: 'Flat', sets: [{ targetReps: 10, targetResistance: 70 }, { targetReps: 10, targetResistance: 70 }, { targetReps: 10, targetResistance: 70 }] },
+      { group: 'Back', name: 'Stiff Arm Pulldown', armPosition: 0, benchPosition: 'Removed', sets: [{ targetReps: 10, targetResistance: 50 }, { targetReps: 10, targetResistance: 50 }, { targetReps: 10, targetResistance: 50 }] },
+      { group: 'Shoulders', name: 'Rear Delt Row', armPosition: 6, benchPosition: 'Flat', sets: [{ targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 40 }] },
+      { group: 'Arms', name: 'Standing Biceps Curl', armPosition: 8, benchPosition: 'Removed', sets: [{ targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 40 }] },
+      { group: 'Arms', name: 'Triceps Pushdown', armPosition: 0, benchPosition: 'Removed', sets: [{ targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 40 }] },
+      { group: 'Core', name: 'Standing Trunk Rotation', armPosition: 3, benchPosition: 'Removed', sets: [{ targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 40 }] },
+      { group: 'Core', name: 'Seated Low Back Extension', armPosition: 8, benchPosition: 'Sliding Seat', sets: [{ targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 40 }] },
+      { group: 'Core', name: 'Resisted Abdominal Crunch', armPosition: 8, benchPosition: '45° Incline', sets: [{ targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 40 }] },
+    ]
+  },
+  // --- ADVANCED ---
+  {
+    id: 'sample-ppl-push',
+    name: 'PPL Split - Push Day',
+    level: 'Advanced',
+    description: '3 Days/Wk. Split (Chest, Shoulders, Triceps). 3 Sets of 8-12 Reps. (Online Split)',
+    exercises: [
+      { group: 'Chest', name: 'Bench Press', armPosition: 8, benchPosition: '45° Incline', sets: [{ targetReps: 10, targetResistance: 70 }, { targetReps: 10, targetResistance: 80 }, { targetReps: 10, targetResistance: 80 }] },
+      { group: 'Chest', name: 'Incline Chest Press', armPosition: 2, benchPosition: '45° Incline', sets: [{ targetReps: 10, targetResistance: 60 }, { targetReps: 10, targetResistance: 60 }, { targetReps: 10, targetResistance: 60 }] },
+      { group: 'Shoulders', name: 'Seated Shoulder Press', armPosition: 7, benchPosition: 'Flat', sets: [{ targetReps: 10, targetResistance: 50 }, { targetReps: 10, targetResistance: 50 }, { targetReps: 10, targetResistance: 60 }] },
+      { group: 'Shoulders', name: 'Standing Lateral Shoulder Raise', armPosition: 9, benchPosition: 'Removed', sets: [{ targetReps: 12, targetResistance: 30 }, { targetReps: 12, targetResistance: 30 }, { targetReps: 12, targetResistance: 40 }] },
+      { group: 'Arms', name: 'Lying Triceps Press', armPosition: 9, benchPosition: 'Flat', sets: [{ targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 50 }, { targetReps: 10, targetResistance: 50 }] },
+      { group: 'Arms', name: 'Triceps Pushdown', armPosition: 0, benchPosition: 'Removed', sets: [{ targetReps: 12, targetResistance: 30 }, { targetReps: 12, targetResistance: 40 }, { targetReps: 12, targetResistance: 40 }] },
+    ]
+  },
+  {
+    id: 'sample-ppl-pull',
+    name: 'PPL Split - Pull Day',
+    level: 'Advanced',
+    description: '3 Days/Wk. Split (Back, Biceps, Rear Delts). 3 Sets of 8-12 Reps. (Online Split)',
+    exercises: [
+      { group: 'Back', name: 'Seated Lat Row', armPosition: 9, benchPosition: 'Flat', sets: [{ targetReps: 10, targetResistance: 80 }, { targetReps: 10, targetResistance: 90 }, { targetReps: 10, targetResistance: 100 }] },
+      { group: 'Back', name: 'Narrow Pulldown w/ Hand Grips', armPosition: 0, benchPosition: 'Flat', sets: [{ targetReps: 10, targetResistance: 70 }, { targetReps: 10, targetResistance: 80 }, { targetReps: 10, targetResistance: 90 }] },
+      { group: 'Shoulders', name: 'Rear Delt Row', armPosition: 6, benchPosition: 'Flat', sets: [{ targetReps: 12, targetResistance: 40 }, { targetReps: 12, targetResistance: 40 }, { targetReps: 12, targetResistance: 50 }] },
+      { group: 'Arms', name: 'Standing Biceps Curl', armPosition: 8, benchPosition: 'Removed', sets: [{ targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 50 }, { targetReps: 10, targetResistance: 60 }] },
+      { group: 'Arms', name: 'Standing Hammer Grip Curls', armPosition: 9, benchPosition: 'Removed', sets: [{ targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 50 }] },
+      { group: 'Shoulders', name: 'Reverse Fly Cable Cross', armPosition: 8, benchPosition: 'Flat', sets: [{ targetReps: 12, targetResistance: 30 }, { targetReps: 12, targetResistance: 40 }, { targetReps: 12, targetResistance: 40 }] },
+    ]
+  },
+  {
+    id: 'sample-ppl-legs',
+    name: 'PPL Split - Legs & Core Day',
+    level: 'Advanced',
+    description: '3 Days/Wk. Split (Lower Body, Calves, Core). 3 Sets of 10-15 Reps. (Online Split)',
+    exercises: [
+      { group: 'Legs', name: 'Leg Press', armPosition: 9, benchPosition: 'Sliding Seat', sets: [{ targetReps: 10, targetResistance: 100 }, { targetReps: 10, targetResistance: 110 }, { targetReps: 10, targetResistance: 120 }] },
+      { group: 'Legs', name: 'Leg Extension', armPosition: 9, benchPosition: 'Leg Extension Seat', sets: [{ targetReps: 12, targetResistance: 70 }, { targetReps: 12, targetResistance: 80 }, { targetReps: 12, targetResistance: 90 }] },
+      { group: 'Legs', name: 'Prone (Lying) Leg Curl', armPosition: 9, benchPosition: 'Flat', sets: [{ targetReps: 12, targetResistance: 60 }, { targetReps: 12, targetResistance: 70 }, { targetReps: 12, targetResistance: 80 }] },
+      { group: 'Legs', name: 'Calf Raise on Leg Press', armPosition: 9, benchPosition: 'Sliding Seat', sets: [{ targetReps: 15, targetResistance: 100 }, { targetReps: 15, targetResistance: 110 }, { targetReps: 15, targetResistance: 120 }] },
+      { group: 'Core', name: 'Resisted Abdominal Crunch', armPosition: 8, benchPosition: '45° Incline', sets: [{ targetReps: 12, targetResistance: 50 }, { targetReps: 12, targetResistance: 50 }, { targetReps: 12, targetResistance: 60 }] },
+      { group: 'Core', name: 'Seated (Resisted) Oblique Crunch', armPosition: 7, benchPosition: '45° Incline', sets: [{ targetReps: 12, targetResistance: 40 }, { targetReps: 12, targetResistance: 40 }, { targetReps: 12, targetResistance: 50 }] },
+    ]
+  },
+  {
+    id: 'sample-strength-day1',
+    name: 'Strength Training (Day 1)',
+    level: 'Advanced',
+    description: '3 Days/Wk. Split. Focus: 5-8 Reps, 2-4 Sets (Heavy Chest/Shoulders). (P. 28)',
+    exercises: [
+      { group: 'Chest', name: 'Bench Press', armPosition: 8, benchPosition: '45° Incline', sets: [{ targetReps: 6, targetResistance: 80 }, { targetReps: 6, targetResistance: 90 }, { targetReps: 6, targetResistance: 100 }] },
+      { group: 'Chest', name: 'Decline Chest Press', armPosition: 7, benchPosition: '45° Incline', sets: [{ targetReps: 6, targetResistance: 70 }, { targetReps: 6, targetResistance: 80 }, { targetReps: 6, targetResistance: 90 }] },
+      { group: 'Shoulders', name: 'Seated Shoulder Press', armPosition: 7, benchPosition: 'Flat', sets: [{ targetReps: 6, targetResistance: 60 }, { targetReps: 6, targetResistance: 70 }, { targetReps: 7, targetResistance: 80 }] },
+      { group: 'Shoulders', name: 'Standing Lateral Shoulder Raise', armPosition: 9, benchPosition: 'Removed', sets: [{ targetReps: 6, targetResistance: 40 }, { targetReps: 6, targetResistance: 50 }, { targetReps: 6, targetResistance: 50 }] },
+      { group: 'Shoulders', name: 'Rear Delt Row', armPosition: 6, benchPosition: 'Flat', sets: [{ targetReps: 6, targetResistance: 40 }, { targetReps: 6, targetResistance: 50 }, { targetReps: 6, targetResistance: 50 }] },
+      { group: 'Shoulders', name: 'Shoulder Shrug', armPosition: 9, benchPosition: 'Removed', sets: [{ targetReps: 8, targetResistance: 100 }, { targetReps: 8, targetResistance: 110 }, { targetReps: 8, targetResistance: 120 }] },
+    ]
+  },
+  {
+    id: 'sample-strength-day2',
+    name: 'Strength Training (Day 2)',
+    level: 'Advanced',
+    description: '3 Days/Wk. Split. Focus: 5-8 Reps, 2-4 Sets (Heavy Back/Arms). (P. 28)',
+    exercises: [
+      { group: 'Back', name: 'Seated Lat Row', armPosition: 9, benchPosition: 'Flat', sets: [{ targetReps: 6, targetResistance: 80 }, { targetReps: 6, targetResistance: 90 }, { targetReps: 6, targetResistance: 100 }] },
+      { group: 'Back', name: 'Narrow Pulldown w/ Hand Grips', armPosition: 0, benchPosition: 'Flat', sets: [{ targetReps: 6, targetResistance: 70 }, { targetReps: 6, targetResistance: 80 }, { targetReps: 6, targetResistance: 90 }] },
+      { group: 'Arms', name: 'Standing Biceps Curl', armPosition: 8, benchPosition: 'Removed', sets: [{ targetReps: 6, targetResistance: 50 }, { targetReps: 6, targetResistance: 60 }, { targetReps: 6, targetResistance: 70 }] },
+      { group: 'Arms', name: 'Tricep Kickback', armPosition: 3, benchPosition: 'Flat', sets: [{ targetReps: 6, targetResistance: 40 }, { targetReps: 6, targetResistance: 50 }, { targetReps: 6, targetResistance: 50 }] },
+      { group: 'Arms', name: 'Triceps Pushdown', armPosition: 0, benchPosition: 'Removed', sets: [{ targetReps: 6, targetResistance: 50 }, { targetReps: 6, targetResistance: 60 }, { targetReps: 6, targetResistance: 70 }] },
+    ]
+  },
+  {
+    id: 'sample-strength-day3',
+    name: 'Strength Training (Day 3)',
+    level: 'Advanced',
+    description: '3 Days/Wk. Split. Focus: 5-8 Reps (Heavy Legs). (P. 28)',
+    exercises: [
+      { group: 'Legs', name: 'Leg Press', armPosition: 9, benchPosition: 'Sliding Seat', sets: [{ targetReps: 6, targetResistance: 100 }, { targetReps: 6, targetResistance: 110 }, { targetReps: 6, targetResistance: 120 }] },
+      { group: 'Legs', name: 'Calf Raise on Leg Press', armPosition: 9, benchPosition: 'Sliding Seat', sets: [{ targetReps: 6, targetResistance: 80 }, { targetReps: 6, targetResistance: 90 }, { targetReps: 6, targetResistance: 100 }] },
+      { group: 'Legs', name: 'Leg Extension', armPosition: 9, benchPosition: 'Leg Extension Seat', sets: [{ targetReps: 6, targetResistance: 70 }, { targetReps: 6, targetResistance: 80 }, { targetReps: 6, targetResistance: 90 }] },
+      { group: 'Legs', name: 'Prone (Lying) Leg Curl', armPosition: 9, benchPosition: 'Flat', sets: [{ targetReps: 6, targetResistance: 60 }, { targetReps: 6, targetResistance: 70 }, { targetReps: 6, targetResistance: 80 }] },
+      { group: 'Core', name: 'Seated Low Back Extension', armPosition: 8, benchPosition: 'Sliding Seat', sets: [{ targetReps: 10, targetResistance: 40 }, { targetReps: 10, targetResistance: 50 }, { targetReps: 10, targetResistance: 60 }] },
+      { group: 'Core', name: 'Resisted Abdominal Crunch', armPosition: 8, benchPosition: '45° Incline', sets: [{ targetReps: 6, targetResistance: 50 }, { targetReps: 6, targetResistance: 60 }, { targetReps: 6, targetResistance: 70 }] },
+    ]
+  }
+];
+
+// Instructions based on the Bowflex Revolution Owner's Manual pages 30-81
+const EXERCISE_INSTRUCTIONS = {
+    'Bench Press': {
+        youtubeLink: getYoutubeLink(7), // [00:00:07]
+        bench: '45° Incline',
+        arms: 'Position 7 or 8',
+        accessory: 'Long Hand Grips',
+        notes: [
+            'Maintain a 90° angle between upper arms and torso.',
+            'Press straight out away from chest.',
+            'Keep shoulder blades pinched together.',
+            'Maintain a slow pace (e.g., three seconds up and three seconds down).'
+        ]
+    },
+    'Chest Fly': {
+        youtubeLink: getYoutubeLink(154), // [00:02:34]
+        bench: '45° Incline',
+        arms: 'Position 7 or 8',
+        accessory: 'Long Hand Grips',
+        notes: [
+            'Keep a very slight bend in the elbow throughout the movement.',
+            'Work hard to keep your rib cage up and shoulders back.',
+            'Stop when your upper arm is just about even with the bench (do not go lower).',
+            'Think about bringing the arms towards the center.'
+        ]
+    },
+    'Incline Chest Press': {
+        youtubeLink: getYoutubeLink(291), // [00:04:51]
+        bench: '45° Incline (Slide up)',
+        arms: 'Position 2 or 9 (different angles)',
+        accessory: 'Long Hand Grips',
+        notes: [
+            'Slide up the bench to create a higher incline angle relative to the pulleys.',
+            'Press slightly upward, keeping chest up.',
+            'Do not take your arms excessively low below the angle of the bench.'
+        ]
+    },
+    'Decline Chest Press': {
+        youtubeLink: getYoutubeLink(560), // [00:09:20]
+        bench: '45° Incline',
+        arms: 'Position 7, 6, or 5',
+        accessory: 'Long Hand Grips',
+        notes: [
+            'Rope should travel under the forearm.',
+            'Press forward, straightening arms while moving hands toward the center and slightly downward.',
+            'Do not lock your elbows. Keep tension on the chest throughout.'
+        ]
+    },
+    'Seated Shoulder Press': {
+        youtubeLink: getYoutubeLink(1750), // [00:29:10]
+        bench: 'Flat Bench Back',
+        arms: 'Position 7 or 8',
+        accessory: 'Long Hand Grips',
+        notes: [
+            'Push up and slightly forward to align with the cable path.',
+            'Focus on keeping your trunk and spine stable (abs tight).',
+            'Let your shoulder blades move up as you reach, and down as you return.',
+            'Elbows should move up and inward toward your ears.'
+        ]
+    },
+    'Standing Lateral Shoulder Raise': {
+        youtubeLink: getYoutubeLink(3290), // [00:54:50]
+        bench: 'Removed',
+        arms: 'Position 9 (or 8/7)',
+        accessory: 'Long Hand Grips (Short D-ring)',
+        notes: [
+            'Stand facing away from the machine, controlling your body position.',
+            'Move arms straight out to the side (or slightly forward depending on stance).',
+            'Think about lifting the elbow more than the handle.',
+            'Control the spine; do not swing or rock your torso.'
+        ]
+    },
+    'Rear Delt Row': {
+        youtubeLink: getYoutubeLink(2702), // [00:45:02]
+        bench: 'Flat Bench Back (Facing Engine)',
+        arms: 'Position 6, 5, or 4',
+        accessory: 'Hand Grips (Cables Crossed)',
+        notes: [
+            'Grab opposite handles so cables are crossed.',
+            'Forearm stays in line with the cable (like an extension of the cable).',
+            'Lead with the elbow, keeping arms out wide (70°-90° angle to torso).',
+            'Pinch your shoulder blades together as you row.'
+        ]
+    },
+    'Shoulder Shrug': {
+        youtubeLink: getYoutubeLink(4514), // [01:15:14]
+        bench: 'Removed',
+        arms: 'Position 9 or 8',
+        accessory: 'Hand Grips (Short D-ring)',
+        notes: [
+            'Stand on the platform, arms straight, palms facing each other (hammer grip).',
+            'Raise your shoulders toward the back of your head (not straight up to the ears).',
+            'Do not bend your neck or slouch. Keep posture stable.',
+            'Control the motion on the way down without relaxing muscle tension.'
+        ]
+    },
+    'Seated Lat Row': {
+        youtubeLink: getYoutubeLink(5185), // [01:26:25]
+        bench: 'Flat Bench Back (Scood back)',
+        arms: 'Position 9 (Low Lat)',
+        accessory: 'Hand Grips (Short D-ring)',
+        notes: [
+            'Sit facing the engine, feet on the footrest.',
+            'Initiate the movement by pinching your shoulder blades together.',
+            'Pull your upper arms downward and backward, brushing past the sides of the body.',
+            'Keep your posture upright and do not rock your torso forward and back.'
+        ]
+    },
+    'Lying Triceps Press': {
+        youtubeLink: getYoutubeLink(7882), // [02:11:22]
+        bench: 'Flat Bench Back',
+        arms: 'Position 9',
+        accessory: 'Long Hand Grips (Short D-ring)',
+        notes: [
+            'Lie down, arms bent, upper arms 90° from torso (or slightly angled).',
+            'Keep upper arms stationary and straighten the elbows to push the weight.',
+            'Angle your push slightly to align the cable/rope with your arm.'
+        ]
+    },
+    'Standing Biceps Curl': {
+        youtubeLink: getYoutubeLink(5979), // [01:39:39]
+        bench: 'Removed',
+        arms: 'Position 8 or 7',
+        accessory: 'Long Hand Grips',
+        notes: [
+            'Stand facing away from the engine with a staggered stance.',
+            'Keep the upper arm stable and stationary—only the forearm moves at the elbow.',
+            'Curl forward and up in an arc (not straight up).',
+            'Stop the curl before the cable rubs on your forearm.'
+        ]
+    },
+    'Seated Low Back Extension': {
+        youtubeLink: getYoutubeLink(9241), // [02:34:01]
+        bench: 'Leg Press Seat Back on Sliding Seat',
+        arms: 'Position 8',
+        accessory: 'Hand Grips (Forearm through webbing)',
+        notes: [
+            'Set up using the short back pad, arms crossed, grips near elbows.',
+            'Lean forward from the hips only (do not bend at the waist or slouch the spine).',
+            'Move slowly into extension, pivoting at the hips.',
+            'Maintain great spinal alignment throughout the entire movement.'
+        ]
+    },
+    'Resisted Abdominal Crunch': {
+        youtubeLink: getYoutubeLink(8271), // [02:17:51]
+        bench: '45° Incline',
+        arms: 'Position 9',
+        accessory: 'Hand Grips',
+        notes: [
+            'Grasp grips and rest fists on chest/sholders.',
+            'Curl only your torso, moving ribs toward hips (do not lead with head/chin).',
+            'Do not allow your lower back to lose contact with the bench.',
+            'Tighten your abs before you move and throughout the entire exercise.'
+        ]
+    },
+    'Leg Extension': {
+        youtubeLink: getYoutubeLink(9795), // [02:43:15]
+        bench: 'Leg Extension Seat',
+        arms: 'Position 9',
+        accessory: 'Leg Extension Attachment',
+        notes: [
+            'Sit with knees near the pivot point.',
+            'Use slow, controlled motion - do not "kick".',
+            'Keep kneecaps pointing up and straight forward throughout the exercise (ignore foot position).',
+            'Slowly reverse the motion without relaxing your quads.'
+        ]
+    },
+    'Prone (Lying) Leg Curl': {
+        youtubeLink: getYoutubeLink(9986), // [02:46:26]
+        bench: 'Flat with Leg Curl Attachment',
+        arms: 'Position 9',
+        accessory: 'Leg Extension Attachment',
+        notes: [
+            'Lie face down, knees slightly off pad (kneecap does not go on top).',
+            'Tighten your abdominals and slightly lift your knees to prevent hip extension (keep your butt down).',
+            'Slowly bend your knees, pulling feet towards hips.',
+            'Maintain great control and position of the thigh throughout.'
+        ]
+    },
+    'Leg Press': {
+        youtubeLink: getYoutubeLink(11800), // [03:16:36]
+        bench: 'Sliding Seat & Leg Press Plate',
+        arms: 'Position 9',
+        accessory: 'Leg Press Plate',
+        notes: [
+            'Ensure your entire foot is on the plate.',
+            'Straighten your legs, but DO NOT lock your knees.',
+            'Keep your low back and pelvis against the seat pad throughout the motion (no low back curl).',
+            'Push through the middle of your foot (tibia/ankle) for even force distribution.'
+        ]
+    },
+    'Calf Raise on Leg Press': {
+        youtubeLink: getYoutubeLink(12295), // [03:20:55]
+        bench: 'Sliding Seat & Leg Press Plate',
+        arms: 'Position 9',
+        accessory: 'Leg Press Plate',
+        notes: [
+            'Place the entire ball of your foot on the edge of the foot plate.',
+            'Keep a slight bend in your knee (do not lock out the knee).',
+            'Slowly press the balls of your feet into the frame, pulling your heels towards your knees.',
+            'Squeeze hard at the top of the motion for a full contraction.'
+        ]
+    },
+    'Triceps Pushdown': {
+        youtubeLink: getYoutubeLink(10175), // [02:49:35] - Time for the Triceps Pushdown section
+        bench: 'Removed',
+        arms: 'Position 0 or 1',
+        accessory: 'Hand Grips',
+        notes: [
+            'Straddle the Seat Rail, facing the engine.',
+            'Keep the upper arm stable and stationary, with elbows next to your trunk.',
+            'Push your arms downward in a gentle arc until hands are near your thighs.',
+            'Fully straighten the elbows, squeezing the triceps at the bottom.'
+        ]
+    },
+    'French Press (Overhead Triceps)': {
+        youtubeLink: getYoutubeLink(10515), // [02:55:15] - Time for the French Press section
+        bench: 'Flat Bench Back',
+        arms: 'Position 9',
+        accessory: 'Long Hand Grips',
+        notes: [
+            'Sit facing away, reach back, and curl handles up to overhead position.',
+            'Keep the upper arm stable and vertical (pointing straight up).',
+            'Straighten your arms slowly over your head.',
+            'Minimize upper arm motion; focus only on elbow extension.'
+        ]
+    },
+    'Standing Chest Press': {
+        youtubeLink: getYoutubeLink(13041), // [03:32:00] - Time for the Standing Chest Press section
+        bench: 'Removed',
+        arms: 'Position 3, 4, or 5',
+        accessory: 'Long Hand Grips',
+        notes: [
+            'Use a staggered stance for stability.',
+            'Press straight forward toward the center, keeping arms 90° from torso (at shoulder height).',
+            'Control your trunk; do not wobble or rock back and forth.',
+            'Maintain alignment with the cable path.'
+        ]
+    },
+    'Stiff Arm Pulldown': {
+        youtubeLink: getYoutubeLink(11710), // [03:15:10] - Time for the Stiff Arm Pulldown section
+        bench: 'Removed',
+        arms: 'Position 0 or 1',
+        accessory: 'Hand Grips',
+        notes: [
+            'Stand facing the machine, stagger your feet, and keep arms straight (but not locked).',
+            'Pull down and back in an arc toward your legs, leading with the shoulders (depressing the scapula).',
+            'Keep your spine stable and straight; do not slouch.',
+            'Control the return motion slowly.'
+        ]
+    },
+    'Tricep Kickback': {
+        youtubeLink: getYoutubeLink(11160), // [03:06:00] - Time for Triceps Kickback section
+        bench: 'Flat Bench Back (Bent over)',
+        arms: 'Position 2, 3, 4, or 5',
+        accessory: 'Short Hand Grips (Hammer Grip)',
+        notes: [
+            'Bend forward at hips until torso is parallel to the bench. Stabilize with one arm.',
+            'Keep the upper arm completely still, parallel to the floor, next to your side.',
+            'Straighten the elbow, pushing the handle backward.',
+            'This exercise is more effective on the Revolution than with dumbbells.'
+        ]
+    },
+    'Standing Trunk Rotation': {
+        youtubeLink: getYoutubeLink(15655), // [04:20:55] - Time for Standing Trunk Rotation section
+        bench: 'Removed',
+        arms: 'Position 3 or 5',
+        accessory: 'Long Hand Grips',
+        notes: [
+            'Stand sideways/angled 45° to the engine, hands grasping the handle.',
+            'Rotate your torso and arms away from the machine (rib cage leads the movement).',
+            'Incorporate lower body movement (pivoting at the hips/feet) for a full exercise.',
+            'Move slowly and control the spine; do not throw the resistance.'
+        ]
+    },
+    'Narrow Pulldown w/ Hand Grips': {
+        youtubeLink: getYoutubeLink(13912), // [03:51:52] - Time for Narrow Pulldown section
+        bench: 'Flat Bench Forward (or use short seat back)',
+        arms: 'Position 0',
+        accessory: 'Hand Grips (Short D-ring)',
+        notes: [
+            'Sit facing the engine, arms straight up.',
+            'Pull down towards your sides, keeping arms moving parallel to the width of your shoulders.',
+            'Focus on depressing the shoulder blades (moving them down towards your waistline).',
+            'Do not let your shoulders move up toward your ears.'
+        ]
+    },
+    'Standing Hammer Grip Curls': {
+        youtubeLink: getYoutubeLink(14400), // [04:00:00] - Time for Hammer Curl section
+        bench: 'Removed',
+        arms: 'Position 9 or 8',
+        accessory: 'Long Hand Grips (Hammer Grip)',
+        notes: [
+            'Grasp grips with palms facing each other (thumb up).',
+            'Keep the upper arm stable and stationary—only the forearm moves at the elbow.',
+            'Curl the handles forward then upward toward the shoulders.',
+            'This grip allows you to use the narrower arm positions (9 or 8).'
+        ]
+    },
+    'Reverse Curl': {
+        youtubeLink: getYoutubeLink(14264), // [03:57:44] - Time for Reverse Curl section
+        bench: 'Removed',
+        arms: 'Position 9 or 8',
+        accessory: 'Hand Grips (Palm Down/Pronated)',
+        notes: [
+            'Grasp grips with palms facing down (pronated grip).',
+            'Keep the upper arm stable and stationary; only the forearm moves.',
+            'Curl the handles forward, focusing on brachialis and brachioradialis.',
+            'The reverse grip eliminates the "carrying angle," allowing for narrower arm positions.'
+        ]
+    },
+};
+
+const initialSetLog = { reps: '', resistance: '', completed: false };
+
+// --- Reducer for Active Workout Session ---
+const workoutReducer = (state, action) => {
+  switch (action.type) {
+    case 'START_WORKOUT':
+      return {
+        ...state,
+        workout: action.payload,
+        logs: action.payload.exercises.map((ex, index) => ({
+          ...ex,
+          id: `${ex.name}-${index}-${Date.now()}`,
+          // Sets are recreated from the workout plan to become log entries
+          sets: ex.sets.map((set, setIndex) => ({
+            ...set,
+            ...initialSetLog,
+            setId: setIndex,
+            targetReps: set.targetReps,
+            targetResistance: set.targetResistance
+          }))
+        })),
+        currentExerciseIndex: 0,
+        currentSetIndex: 0,
+        restTimerActive: false,
+        restTimeRemaining: action.payload.restTimeSetting || 60,
+        status: 'active' // Set status here
+      };
+    case 'LOG_SET': {
+      const { exIndex, setIndex, reps, resistance } = action.payload;
+      const newLogs = [...state.logs];
+      newLogs[exIndex].sets[setIndex] = {
+        ...newLogs[exIndex].sets[setIndex],
+        reps: parseInt(reps) || 0,
+        resistance: parseInt(resistance) || 0,
+        completed: true
+      };
+      return { ...state, logs: newLogs };
+    }
+    case 'NEXT_SET_OR_EXERCISE': {
+      const { exIndex, setIndex, defaultRestTime } = action.payload;
+      const nextSetIndex = setIndex + 1;
+      const currentExercise = state.logs[exIndex];
+      const newRestTime = defaultRestTime || 60; // Use setting
+
+      if (nextSetIndex < currentExercise.sets.length) {
+        // Next set in the same exercise
+        return {
+          ...state,
+          currentSetIndex: nextSetIndex,
+          restTimerActive: true,
+          restTimeRemaining: newRestTime
+        };
+      } else if (exIndex + 1 < state.logs.length) {
+        // Next exercise
+        return {
+          ...state,
+          currentExerciseIndex: exIndex + 1,
+          currentSetIndex: 0,
+          restTimerActive: true,
+          restTimeRemaining: newRestTime
+        };
+      } else {
+        // Workout complete
+        return { ...state, status: 'complete', restTimerActive: false };
+      }
+    }
+    case 'TICK_REST_TIMER':
+      return { ...state, restTimeRemaining: Math.max(0, state.restTimeRemaining - 1) };
+    case 'TOGGLE_REST_TIMER':
+      return { ...state, restTimerActive: !state.restTimerActive };
+    case 'RESET_TIMER':
+      return { ...state, restTimeRemaining: state.workout?.restTimeSetting || 60 }; // Reset to custom setting
+    case 'STOP_WORKOUT':
+      return initialWorkoutState;
+    default:
+      return state;
+  }
+};
+
+const initialWorkoutState = {
+  workout: null,
+  logs: [],
+  currentExerciseIndex: 0,
+  currentSetIndex: 0,
+  restTimerActive: false,
+  restTimeRemaining: 60,
+  status: 'idle' // 'idle', 'active', 'complete'
+};
+
+
+// --- Firebase Context and Hook ---
+const FirebaseContext = React.createContext();
+
+const useFirebase = () => React.useContext(FirebaseContext);
+
+const FirebaseProvider = ({ children }) => {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+
+  useEffect(() => {
+    if (!FIREBASE_CONFIG) {
+      console.error("Firebase config is missing.");
+      return;
+    }
+
+    try {
+      const app = initializeApp(JSON.parse(FIREBASE_CONFIG));
+      const firestore = getFirestore(app);
+      const userAuth = getAuth(app);
+      setDb(firestore);
+      setAuth(userAuth);
+      console.debug('Firebase services initialized.');
+
+      const unsubscribe = onAuthStateChanged(userAuth, async (user) => {
+        if (user) {
+          setUserId(user.uid);
+          console.debug(`Authenticated user ID: ${user.uid}`);
+        } else {
+          // Sign in anonymously if no initial token is present or auth fails
+          if (!INITIAL_AUTH_TOKEN) {
+            const anonUser = await signInAnonymously(userAuth);
+            setUserId(anonUser.user.uid);
+            console.debug(`Signed in anonymously with ID: ${anonUser.user.uid}`);
+          }
+        }
+        setIsAuthReady(true);
+      });
+
+      // Attempt to sign in with custom token if available
+      if (INITIAL_AUTH_TOKEN) {
+        signInWithCustomToken(userAuth, INITIAL_AUTH_TOKEN)
+          .catch(error => {
+            console.error("Custom token sign-in failed. Falling back to anonymous.", error);
+            signInAnonymously(userAuth).then(anonUser => setUserId(anonUser.user.uid));
+          });
+      }
+
+      return () => unsubscribe();
+    } catch (error) {
+      console.error("Error initializing Firebase:", error);
+    }
+  }, []);
+
+  return (
+    <FirebaseContext.Provider value={{ db, auth, userId, isAuthReady, APP_ID }}>
+      {children}
+    </FirebaseContext.Provider>
+  );
+};
+
+
+// --- Firestore Utility Hooks ---
+
+const useFirestoreCollection = (collectionName, isPublic = false) => {
+  const { db, userId, isAuthReady, APP_ID } = useFirebase();
+  const [data, setData] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  const getCollectionRef = () => {
+    if (!db || !userId) return null;
+    const base = `/artifacts/${APP_ID}/${isPublic ? 'public/data' : `users/${userId}`}`;
+    return collection(db, `${base}/${collectionName}`);
+  };
+
+  useEffect(() => {
+    if (!isAuthReady || !db || !userId) {
+      if (isAuthReady) setLoading(false);
+      return;
+    }
+
+    const colRef = getCollectionRef();
+    if (!colRef) return;
+
+    setLoading(true);
+    const q = query(colRef);
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const list = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setData(list);
+      setLoading(false);
+    }, (err) => {
+      console.error(`Firestore error fetching ${collectionName}:`, err);
+      setError(err);
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [db, userId, isAuthReady, collectionName, APP_ID]);
+
+  const saveDocument = async (docData, docId = null) => {
+    if (!db || !userId) return console.error('DB not ready or user not authenticated.');
+    try {
+      const colRef = getCollectionRef();
+      if (docId) {
+        await setDoc(doc(colRef, docId), docData, { merge: true });
+        return docId;
+      } else {
+        const newDocRef = doc(colRef);
+        await setDoc(newDocRef, docData);
+        return newDocRef.id;
+      }
+    } catch (e) {
+      console.error("Error saving document: ", e);
+      throw e;
+    }
+  };
+
+  const deleteDocument = async (docId) => {
+    if (!db || !userId) return console.error('DB not ready or user not authenticated.');
+    try {
+      const colRef = getCollectionRef();
+      await deleteDoc(doc(colRef, docId));
+    } catch (e) {
+      console.error("Error deleting document: ", e);
+      throw e;
+    }
+  };
+
+  return { data, loading, error, saveDocument, deleteDocument };
+};
+
+
+// --- Helper for Achievement Logic ---
+
+/**
+ * Calculates current user stats for achievements and progress dashboard.
+ * Also checks for and and saves any newly unlocked achievements.
+ */
+const useAchievementStats = (logs, achievements, saveAchievement) => {
+  const [stats, setStats] = useState({
+    totalWorkouts: 0,
+    totalReps: 0,
+    maxLegPress: 0,
+    maxBenchPress: 0,
+  });
+
+  // 1. Calculate Cumulative Stats from Logs
+  useEffect(() => {
+    let totalReps = 0;
+    let maxLegPress = 0;
+    let maxBenchPress = 0;
+    let totalVolume = 0; // for dashboard
+
+    for (const log of logs) {
+      for (const ex of log.exercisesLogged) {
+        for (const set of ex.sets) {
+          const reps = set.reps || 0;
+          // Store resistance is always LBS
+          const resistance = set.resistance || 0;
+          
+          totalReps += reps;
+          totalVolume += reps * resistance;
+
+          if (ex.name === 'Leg Press' && resistance > maxLegPress) {
+            maxLegPress = resistance;
+          }
+          if (ex.name === 'Bench Press' && resistance > maxBenchPress) {
+            maxBenchPress = resistance;
+          }
+        }
+      }
+    }
+    
+    setStats({
+      totalWorkouts: logs.length,
+      totalReps,
+      // Maxes are stored in Lbs as the source of truth
+      maxLegPress,
+      maxBenchPress,
+      totalVolume,
+    });
+  }, [logs]);
+
+  // 2. Check for new achievements
+  useEffect(() => {
+    const achievedIds = new Set(achievements.map(a => a.id));
+    const newAchievements = [];
+
+    for (const goal of ACHIEVEMENT_GOALS) {
+      if (!achievedIds.has(goal.id) && goal.check(stats)) {
+        newAchievements.push(goal);
+      }
+    }
+
+    if (newAchievements.length > 0) {
+      newAchievements.forEach(async (ach) => {
+        try {
+          await saveAchievement({
+            id: ach.id,
+            name: ach.name,
+            category: ach.category,
+            description: ach.description,
+            dateAchieved: serverTimestamp(),
+          }, ach.id);
+          console.log(`New achievement unlocked: ${ach.name}`);
+        } catch (e) {
+          console.error("Failed to save achievement:", e);
+        }
+      });
+    }
+  }, [stats, achievements, saveAchievement]);
+
+  return { stats, achievements };
+};
+
+// Function to find the single best set logged for a specific exercise
+const getPreviousBestForExercise = (logs, exerciseName) => {
+    let bestReps = 0;
+    let bestResistance = 0;
+
+    for (const log of logs) {
+        const exerciseLog = log.exercisesLogged.find(ex => ex.name === exerciseName);
+        if (exerciseLog) {
+            for (const set of exerciseLog.sets) {
+                const reps = set.reps || 0;
+                const resistance = set.resistance || 0;
+                
+                // Track best set: highest resistance first, then highest reps at that resistance
+                if (resistance > bestResistance) {
+                    bestResistance = resistance;
+                    bestReps = reps;
+                } else if (resistance === bestResistance && reps > bestReps) {
+                    bestReps = reps;
+                }
+            }
+        }
+    }
+
+    return { bestReps, bestResistance, hasPrevious: bestResistance > 0 };
+};
+
+
+// --- Components ---
+
+// 1. Core UI Components
+const Card = ({ children, className = '' }) => (
+  <div className={`bg-gray-800 shadow-xl rounded-2xl p-4 transition-all ${className}`}>
+    {children}
+  </div>
+);
+
+const Button = ({ children, onClick, disabled = false, className = 'bg-red-600 hover:bg-red-700 text-white' }) => (
+  <button
+    onClick={onClick}
+    disabled={disabled}
+    className={`px-4 py-2 font-semibold rounded-xl transition-all duration-200 shadow-md ${className} ${disabled ? 'opacity-50 cursor-not-allowed shadow-none' : 'active:shadow-none active:scale-[.98]'}`}
+  >
+    {children}
+  </button>
+);
+
+const IconButton = ({ children, onClick, disabled = false, className = 'bg-gray-700 hover:bg-gray-600 text-gray-300' }) => (
+  <button
+    onClick={onClick}
+    disabled={disabled}
+    className={`p-2 rounded-full transition-all duration-200 ${className} ${disabled ? 'opacity-50 cursor-not-allowed' : 'active:scale-90'}`}
+  >
+    {children}
+  </button>
+);
+
+
+// Instructional Modal Component
+const ExerciseInstructionModal = ({ exerciseName, exerciseConfig, onClose }) => {
+    const instruction = EXERCISE_INSTRUCTIONS[exerciseName];
+
+    // Fallback in case instructions aren't defined yet
+    if (!instruction) {
+        return (
+            <div className="fixed inset-0 bg-gray-900 bg-opacity-90 z-50 flex items-center justify-center p-4">
+                <Card className="max-w-md w-full p-6 text-center bg-gray-800">
+                    <h3 className="text-xl font-bold text-gray-100 mb-4">Instructions for: {exerciseName}</h3>
+                    <p className="text-gray-400">No specific setup instructions found yet. Please consult your Bowflex Revolution Owner's Manual.</p>
+                    <Button onClick={onClose} className="mt-6 w-full bg-red-600">
+                        Close
+                    </Button>
+                </Card>
+            </div>
+        );
+    }
+
+    return (
+        <div className="fixed inset-0 bg-gray-900 bg-opacity-90 z-50 flex items-center justify-center p-4">
+            <Card className="max-w-md w-full p-6 bg-gray-800">
+                <div className="flex justify-between items-start mb-4">
+                    <h3 className="text-2xl font-bold text-red-500">How to: {exerciseName}</h3>
+                    <IconButton onClick={onClose} className="bg-red-900/50 text-red-400 hover:bg-red-900">
+                        <Trash2 size={20} />
+                    </IconButton>
+                </div>
+
+                <div className="space-y-4 text-gray-300">
+                    <div className="grid grid-cols-2 gap-3 p-3 bg-red-900/40 rounded-xl font-medium">
+                        <p className="text-sm text-red-400">Target Bench:</p>
+                        <p className="text-base text-gray-100">{exerciseConfig.benchPosition || instruction.bench || 'Varies'}</p>
+                        <p className="text-sm text-red-400">Target Arm Pos:</p>
+                        <p className="text-base text-gray-100">{exerciseConfig.armPosition || instruction.arms || 'Varies'}</p>
+                        <p className="text-sm text-red-400">Default Accessory:</p>
+                        <p className="text-base text-gray-100">{instruction.accessory || 'Hand Grips'}</p>
+                    </div>
+
+                    <h4 className="font-bold text-lg border-b border-gray-700 pb-1">Execution Tips:</h4>
+                    <ul className="list-disc list-inside text-sm space-y-2">
+                        {instruction.notes.map((note, index) => (
+                            <li key={index} className="text-gray-300">{note}</li>
+                        ))}
+                    </ul>
+                </div>
+                
+                {instruction.youtubeLink && (
+                    <a href={instruction.youtubeLink} target="_blank" rel="noopener noreferrer" className="block mt-6">
+                        <Button className="w-full bg-red-600 hover:bg-red-700 flex items-center justify-center">
+                            <Youtube size={20} className="mr-2" /> Watch Video Instruction
+                        </Button>
+                    </a>
+                )}
+
+                <Button onClick={onClose} className={`mt-3 w-full bg-gray-700 hover:bg-gray-600 text-white`}>
+                    Got it, start working out
+                </Button>
+            </Card>
+        </div>
+    );
+};
+
+// Camera Modal Component
+const CameraMirror = ({ onClose }) => {
+    const videoRef = useRef(null);
+    const [status, setStatus] = useState('Requesting Camera...');
+
+    useEffect(() => {
+        let stream = null;
+        
+        const startCamera = async () => {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                setStatus('Camera API not supported on this device/browser.');
+                return;
+            }
+
+            try {
+                // Request access to the user-facing (selfie) camera
+                stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: {
+                        facingMode: 'user' 
+                    } 
+                });
+                
+                if (videoRef.current) {
+                    videoRef.current.srcObject = stream;
+                    videoRef.current.play();
+                    setStatus('Live Camera Feed');
+                }
+            } catch (err) {
+                console.error("Camera access error:", err);
+                // More helpful error message for the user
+                setStatus(`Permission Denied or Camera Error: ${err.name}. Please ensure your camera is enabled in browser settings.`);
+            }
+        };
+
+        startCamera();
+
+        // Cleanup: stop the video stream when the component unmounts
+        return () => {
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+            }
+        };
+    }, []);
+
+    return (
+        <div className="fixed inset-0 bg-gray-900 bg-opacity-90 z-50 flex flex-col items-center justify-start p-4">
+            <Card className="max-w-xl w-full p-4 bg-gray-900">
+                <div className="flex justify-between items-center mb-3">
+                    <h3 className="text-xl font-bold text-red-500 flex items-center">
+                        <Video size={20} className='mr-2' /> Form Check Mirror
+                    </h3>
+                    <IconButton onClick={onClose} className="bg-red-900/50 text-red-400 hover:bg-red-900">
+                        Close
+                    </IconButton>
+                </div>
+                
+                <div className="relative bg-black rounded-lg overflow-hidden border-2 border-gray-700" style={{ paddingBottom: '75%', height: 0 }}>
+                    <video 
+                        ref={videoRef} 
+                        className="absolute top-0 left-0 w-full h-full object-cover transform scale-x-[-1]" // Scale-x for mirror effect
+                        autoPlay 
+                        playsInline
+                        style={{ display: status === 'Live Camera Feed' ? 'block' : 'none' }}
+                    />
+                    {status !== 'Live Camera Feed' && (
+                        <div className="absolute inset-0 flex items-center justify-center text-center text-gray-400 p-4">
+                            <p>{status}</p>
+                        </div>
+                    )}
+                </div>
+                
+                <p className="text-xs text-gray-500 mt-2">
+                    Tip: Use the front-facing camera as a live mirror to check your exercise form.
+                </p>
+                
+            </Card>
+        </div>
+    );
+};
+
+
+// 2.1 Workout Builder Tab
+const WorkoutBuilder = ({ workouts, saveWorkout, deleteWorkout, initialData, resetInitialData, unitSystem }) => {
+  const [name, setName] = useState(initialData.name || '');
+  const [exercises, setExercises] = useState(initialData.exercises || []);
+  const [isEditing, setIsEditing] = useState(!!initialData.id);
+  const [editId, setEditId] = useState(initialData.id || null);
+  const [critique, setCritique] = useState(null);
+  const [isCritiquing, setIsCritiquing] = useState(false);
+
+  const resistanceUnit = unitSystem === 'metric' ? 'Kg' : 'Lbs';
+  const resistanceConversion = unitSystem === 'metric' ? LBS_TO_KG : (val) => val;
+  const inverseResistanceConversion = unitSystem === 'metric' ? KG_TO_LBS : (val) => val;
+  
+
+  useEffect(() => {
+      // Update local state when initialData changes (e.g., from duplication or edit)
+      if (initialData.name) {
+          setName(initialData.name);
+          // Ensure exercises have the new setup properties for editing
+          const safeExercises = initialData.exercises.map(ex => ({
+              ...ex,
+              armPosition: ex.armPosition || 'Varies',
+              benchPosition: ex.benchPosition || 'Varies',
+          }));
+          setExercises(safeExercises);
+          setEditId(initialData.id);
+          setIsEditing(!!initialData.id); // Re-evaluate if editing existing saved workout
+          setCritique(null); // Clear critique when loading a new workout
+      }
+  }, [initialData]);
+
+  const addExercise = (group, name) => {
+    setExercises([...exercises, {
+      group, 
+      name, 
+      armPosition: 'Varies', // Set default
+      benchPosition: 'Varies', // Set default
+      sets: [{ targetReps: 10, targetResistance: 40 }] 
+    }]);
+    setCritique(null);
+  };
+
+  const addSetToExercise = (index) => {
+    const newExercises = [...exercises];
+    const lastResistanceLbs = newExercises[index].sets.length > 0 ? newExercises[index].sets[newExercises[index].sets.length - 1].targetResistance : 40;
+    newExercises[index].sets.push({ targetReps: 10, targetResistance: lastResistanceLbs }); // Store new resistance in Lbs
+    setExercises(newExercises);
+    setCritique(null);
+  };
+
+  // Function to update properties stored on the Exercise object itself
+  const updateExerciseProperty = (exIndex, field, value) => {
+      const newExercises = [...exercises];
+      newExercises[exIndex][field] = value;
+      setExercises(newExercises);
+      setCritique(null);
+  };
+
+  // Handles updating set fields, converting Kg back to Lbs for storage if needed
+  const updateSet = (exIndex, setIndex, field, value) => {
+    const newExercises = [...exercises];
+    let numericValue = parseInt(value) || 0;
+    
+    if (field === 'targetResistance') {
+      // Convert the user-inputted value (which could be Kg) back to Lbs for storage
+      const lbsValue = inverseResistanceConversion(numericValue);
+      newExercises[exIndex].sets[setIndex][field] = lbsValue; 
+    } else {
+      newExercises[exIndex].sets[setIndex][field] = numericValue;
+    }
+    setExercises(newExercises);
+    setCritique(null);
+  };
+
+  const removeExercise = (index) => {
+    setExercises(exercises.filter((_, i) => i !== index));
+    setCritique(null);
+  };
+
+  const handleSave = async () => {
+    if (!name.trim() || exercises.length === 0) return;
+    const workoutData = {
+      name: name.trim(),
+      exercises,
+      createdAt: serverTimestamp(),
+      totalExercises: exercises.length
+    };
+    try {
+      await saveWorkout(workoutData, editId);
+      resetForm();
+    } catch (e) {
+      console.error("Failed to save workout: ", e);
+    }
+  };
+
+  const handleEdit = (workout) => {
+    // This is used for already saved workouts
+    setName(workout.name);
+    // Deep copy and ensure setup fields exist for editing
+    const safeExercises = workout.exercises.map(ex => ({
+      ...ex,
+      armPosition: ex.armPosition || 'Varies',
+      benchPosition: ex.benchPosition || 'Varies',
+    }));
+    setExercises(safeExercises);
+    setEditId(workout.id);
+    setIsEditing(true);
+    resetInitialData(); // Clear global initial state if set
+  };
+
+  const resetForm = () => {
+    setName('');
+    setExercises([]);
+    setEditId(null);
+    setIsEditing(false);
+    resetInitialData(); // Clear global initial state
+    setCritique(null);
+  };
+
+  const handleCritique = async () => {
+    if (!name.trim() || exercises.length === 0) return;
+    setIsCritiquing(true);
+    setCritique(null);
+    try {
+        const result = await getWorkoutCritique({ name, exercises });
+        setCritique(result);
+    } catch (e) {
+        setCritique("Error getting critique. Please check your network or try again.");
+    } finally {
+        setIsCritiquing(false);
+    }
+  };
+
+  return (
+    <div className="p-4 space-y-4">
+      <Card>
+        <h2 className="text-xl font-bold text-red-500 mb-4">
+          {isEditing ? 'Edit Workout' : 'Create New Workout'}
+        </h2>
+        <input
+          type="text"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="Workout Name (e.g., Push Day)"
+          className="w-full p-3 mb-4 border border-gray-600 bg-gray-700 text-gray-100 rounded-xl focus:ring-red-500 focus:border-red-500"
+        />
+        
+        {/* AI Critique Button */}
+        <Button 
+            onClick={handleCritique} 
+            disabled={!name.trim() || exercises.length === 0 || isCritiquing} 
+            className="w-full mb-4 bg-red-900/60 text-red-400 hover:bg-red-900/80 flex items-center justify-center"
+        >
+            {isCritiquing ? (
+                <>
+                    <RefreshCw size={16} className="animate-spin mr-2" /> Analyzing...
+                </>
+            ) : (
+                <>
+                    <Zap size={16} className="mr-2" /> Get AI Critique ✨
+                </>
+            )}
+        </Button>
+        
+        {/* AI Critique Display */}
+        {critique && (
+            <Card className={`mb-4 p-4 text-sm ${critique.startsWith('Error') ? 'bg-red-900 text-red-300' : 'bg-green-900/50 text-green-300'} border-l-4 border-green-500`}>
+                <p className='font-bold text-base mb-1 flex items-center'>
+                    <Info size={16} className='mr-2' /> Coach's Review:
+                </p>
+                <p>{critique}</p>
+            </Card>
+        )}
+
+        <div className="space-y-4">
+          {exercises.map((ex, exIndex) => (
+            <div key={exIndex} className="bg-gray-700 p-3 rounded-xl border border-red-900">
+              <div className="flex justify-between items-center mb-2">
+                <h3 className="font-semibold text-lg text-gray-100">{ex.name} ({ex.group})</h3>
+                <IconButton onClick={() => removeExercise(exIndex)} className="text-red-500 bg-red-900/50 hover:bg-red-900">
+                  <Trash2 size={18} />
+                </IconButton>
+              </div>
+
+              {/* New Setup Fields */}
+              <div className="flex space-x-2 mb-3">
+                <select
+                  value={ex.armPosition}
+                  onChange={(e) => updateExerciseProperty(exIndex, 'armPosition', e.target.value)}
+                  className="w-1/2 p-2 text-sm border border-gray-600 bg-gray-900 text-white rounded-lg"
+                >
+                  <option value="Varies">Arm Pos (0-9)</option>
+                  {ARM_POSITIONS.map(pos => <option key={pos} value={pos}>Arm Pos: {pos}</option>)}
+                </select>
+                <select
+                  value={ex.benchPosition}
+                  onChange={(e) => updateExerciseProperty(exIndex, 'benchPosition', e.target.value)}
+                  className="w-1/2 p-2 text-sm border border-gray-600 bg-gray-900 text-white rounded-lg"
+                >
+                  <option value="Varies">Bench Setup</option>
+                  {BENCH_POSITIONS.map(pos => <option key={pos} value={pos}>Bench: {pos}</option>)}
+                </select>
+              </div>
+
+              {ex.sets.map((set, setIndex) => (
+                <div key={setIndex} className="flex space-x-2 mb-2 p-2 bg-gray-800 rounded-lg shadow-sm">
+                  <span className="font-medium text-sm w-8 flex-shrink-0 flex items-center justify-center bg-red-900 text-red-400 rounded-lg">S{setIndex + 1}</span>
+                  <input
+                    type="number"
+                    // Display converted value (Kg if metric)
+                    value={set.targetReps}
+                    onChange={(e) => updateSet(exIndex, setIndex, 'targetReps', e.target.value)}
+                    placeholder="Reps"
+                    min="1"
+                    className="w-1/2 p-1 text-center border border-gray-600 bg-gray-900 text-white rounded-lg text-sm"
+                  />
+                  <span className="flex-shrink-0 flex items-center text-gray-400 text-sm">Reps</span>
+                  <input
+                    type="number"
+                    // Display converted value (Kg if metric)
+                    value={resistanceConversion(set.targetResistance)}
+                    onChange={(e) => updateSet(exIndex, setIndex, 'targetResistance', e.target.value)}
+                    placeholder={resistanceUnit}
+                    min="1"
+                    step={unitSystem === 'metric' ? "2.5" : "5"}
+                    className="w-1/2 p-1 text-center border border-gray-600 bg-gray-900 text-white rounded-lg text-sm"
+                  />
+                  <span className="flex-shrink-0 flex items-center text-gray-400 text-sm">{resistanceUnit}</span>
+                </div>
+              ))}
+              <Button onClick={() => addSetToExercise(exIndex)} className="w-full mt-2 text-sm bg-red-900/60 text-red-400 hover:bg-red-900">
+                <Plus size={16} className="inline mr-1" /> Add Set
+              </Button>
+            </div>
+          ))}
+        </div>
+
+        <div className="mt-6 flex justify-between space-x-2">
+          <Button onClick={handleSave} disabled={!name.trim() || exercises.length === 0} className="w-1/2">
+            {isEditing ? 'Update Workout' : 'Save Workout'}
+          </Button>
+          <Button onClick={resetForm} className="w-1/2 bg-gray-700 hover:bg-gray-600 text-white">
+            {isEditing ? 'Cancel Edit' : 'Clear Form'}
+          </Button>
+        </div>
+
+        <details className="mt-4 border-t border-gray-700 pt-4">
+          <summary className="font-medium text-red-500 cursor-pointer">
+            + Add Bowflex Revolution Exercise
+          </summary>
+          <div className="grid grid-cols-2 gap-2 mt-3 max-h-60 overflow-y-auto pr-2">
+            {BOWFLEX_EXERCISES.map((ex, index) => (
+              <Button
+                key={index}
+                onClick={() => addExercise(ex.group, ex.name)}
+                className="text-xs bg-red-900/50 text-red-400 hover:bg-red-900 py-1"
+              >
+                {ex.name}
+              </Button>
+            ))}
+          </div>
+        </details>
+      </Card>
+
+      <h2 className="text-xl font-bold text-gray-100 mt-6 border-t border-gray-700 pt-4">Your Saved Workouts</h2>
+      <div className="space-y-3">
+        {workouts.map(w => (
+          <Card key={w.id} className="flex justify-between items-center p-3">
+            <div>
+              <p className="font-bold text-gray-100">{w.name}</p>
+              <p className="text-sm text-gray-400">{w.exercises.length} Exercises</p>
+            </div>
+            <div className="flex space-x-2">
+              {/* Clicking this button should switch to edit mode in the builder */}
+              <IconButton onClick={() => handleEdit(w)} className="text-red-500 bg-red-900/50 hover:bg-red-900">
+                <List size={18} />
+              </IconButton>
+              <IconButton onClick={() => deleteWorkout(w.id)} className="text-red-500 bg-red-900/50 hover:bg-red-900">
+                <Trash2 size={18} />
+              </IconButton>
+            </div>
+          </Card>
+        ))}
+        {workouts.length === 0 && <p className="text-center text-gray-400 italic">No custom workouts. Use the form above to start building!</p>}
+      </div>
+    </div>
+  );
+};
+
+// 2.2 Workout Home/Logger Tab
+const WorkoutLogger = ({ workouts, logs, startWorkout, stopWorkout, activeWorkoutState, dispatch, saveLog, duplicateAndEdit, restTimeSetting, unitSystem }) => {
+  const { status, workout, logs: activeLogs, currentExerciseIndex, currentSetIndex, restTimerActive, restTimeRemaining } = activeWorkoutState;
+  const setLogRef = useRef({ reps: '', resistance: '' });
+  const [showInstructions, setShowInstructions] = useState(false);
+  const [showCamera, setShowCamera] = useState(false); // New state for camera modal
+  const [showSurvey, setShowSurvey] = useState(true); // New state for survey visibility
+  const [recommendedWorkout, setRecommendedWorkout] = useState(null);
+
+  const currentLog = activeLogs[currentExerciseIndex];
+  const currentSet = currentLog?.sets[currentSetIndex];
+  
+  const resistanceUnit = unitSystem === 'metric' ? 'Kg' : 'Lbs';
+  const displayResistance = (val) => convertResistance(val, unitSystem);
+  const inputResistanceConversion = unitSystem === 'metric' ? KG_TO_LBS : (val) => val;
+
+  // Function for dynamic resistance suggestion (renamed to avoid conflict)
+  const getDynamicRecommendation = () => {
+      // Find the previous set's results only if not the very first set of the entire workout
+      if (currentSetIndex === 0 && currentExerciseIndex === 0) return null;
+
+      let previousSet;
+      if (currentSetIndex > 0) {
+          // Normal flow: previous set of the same exercise
+          previousSet = activeLogs[currentExerciseIndex].sets[currentSetIndex - 1];
+      } else {
+          // First set of a new exercise: check the *last* set of the *previous* exercise
+          const prevExIndex = currentExerciseIndex - 1;
+          const prevEx = activeLogs[prevExIndex];
+          previousSet = prevEx.sets[prevEx.sets.length - 1];
+      }
+      
+      if (!previousSet || !previousSet.completed) return null;
+
+      // Note: All stored resistance values are in Lbs
+      const achievedReps = previousSet.reps;
+      const targetReps = previousSet.targetReps;
+      const achievedResistanceLbs = previousSet.resistance;
+      
+      if (achievedReps >= targetReps) {
+          // Success: Recommend +5 Lbs
+          const newResistanceLbs = achievedResistanceLbs + 5;
+          const newResistanceDisplay = displayResistance(newResistanceLbs);
+          return { type: 'success', message: `Crushed it! Try increasing the load to ${newResistanceDisplay} ${resistanceUnit}.` };
+      } else if (achievedReps < targetReps && achievedReps >= targetReps * 0.8) {
+          // Close failure: Recommend staying put
+          const achievedResistanceDisplay = displayResistance(achievedResistanceLbs);
+          return { type: 'hold', message: `Good effort. Hold ${achievedResistanceDisplay} ${resistanceUnit} and focus on form this set.` };
+      } else {
+          // Significant failure: Recommend dropping weight
+          const newResistanceLbs = Math.max(5, achievedResistanceLbs - 5);
+          const newResistanceDisplay = displayResistance(newResistanceLbs);
+          return { type: 'drop', message: `Tough set. Drop the resistance to ${newResistanceDisplay} ${resistanceUnit} to hit your rep target.` };
+      }
+  };
+
+  // Renamed variable to use the correct function
+  const nextRecommendation = getDynamicRecommendation();
+
+  const handleLogSet = () => {
+    if (!currentLog || !currentSet) return;
+    
+    const repsInput = document.getElementById('repsInput');
+    const resistanceInput = document.getElementById('resistanceInput');
+
+    const reps = setLogRef.current.reps || (repsInput ? repsInput.value : currentSet.targetReps);
+    const resistanceInputVal = setLogRef.current.resistance || (resistanceInput ? resistanceInput.value : currentSet.targetResistance);
+    
+    // Convert the user-inputted resistance (which may be in Kg) back to Lbs for storage
+    const resistanceLbs = inputResistanceConversion(resistanceInputVal);
+    
+    // Dispatch the log action (always store resistance in Lbs)
+    dispatch({
+      type: 'LOG_SET',
+      payload: {
+        exIndex: currentExerciseIndex,
+        setIndex: currentSetIndex,
+        reps,
+        resistance: resistanceLbs
+      }
+    });
+
+    // Move to the next set/exercise, passing the configured rest time
+    dispatch({
+      type: 'NEXT_SET_OR_EXERCISE',
+      payload: { exIndex: currentExerciseIndex, setIndex: currentSetIndex, defaultRestTime: restTimeSetting }
+    });
+    
+    // Reset inputs for next set
+    setLogRef.current = { reps: '', resistance: '' };
+    if (repsInput) repsInput.value = '';
+    if (resistanceInput) resistanceInput.value = '';
+
+    // Automatically close camera if it was open
+    if(showCamera) setShowCamera(false);
+  };
+
+  // Timer useEffect
+  useEffect(() => {
+    let interval = null;
+    if (restTimerActive && restTimeRemaining > 0) {
+      interval = setInterval(() => {
+        dispatch({ type: 'TICK_REST_TIMER' });
+      }, 1000);
+    } else if (restTimeRemaining === 0) {
+      dispatch({ type: 'TOGGLE_REST_TIMER' }); // Stop timer
+    }
+    return () => clearInterval(interval);
+  }, [restTimerActive, restTimeRemaining, dispatch]);
+
+  // Complete Workout Handler
+  const handleCompleteWorkout = async () => {
+    try {
+      const logData = {
+        workoutName: workout.name,
+        logTime: serverTimestamp(),
+        // logs[0] will contain the startTime added during START_WORKOUT dispatch
+        durationMinutes: Math.ceil((Date.now() - activeLogs[0].startTime) / 60000), 
+        exercisesLogged: activeLogs.map(ex => ({
+          name: ex.name,
+          group: ex.group,
+          sets: ex.sets.map(set => ({
+            reps: set.reps,
+            resistance: set.resistance, // Stored in Lbs
+            targetReps: set.targetReps,
+            targetResistance: set.targetResistance // Stored in Lbs
+          }))
+        }))
+      };
+      await saveLog(logData);
+      stopWorkout();
+    } catch (e) {
+      console.error("Failed to save workout log:", e);
+    }
+  };
+
+  const workoutsToDisplay = workouts.length > 0 ? workouts : SAMPLE_WORKOUTS;
+  const prevBest = getPreviousBestForExercise(logs, currentLog?.name);
+
+  // --- Recommendation Logic (This function was conflicting, renamed below) ---
+  const handleSurveyComplete = (recommendationId) => {
+    setRecommendedWorkout(SAMPLE_WORKOUTS.find(w => w.id === recommendationId));
+    setShowSurvey(false);
+  };
+
+  const getWorkoutRecommendationId = (level, frequency, duration) => {
+    // 1. Filter by Level
+    let candidates = SAMPLE_WORKOUTS.filter(w => w.level === level);
+
+    // 2. Filter/Score by Frequency and Duration (Simplistic logic for demonstration)
+    if (frequency === '3-4' && duration === '20-30') {
+      // Prioritize full body or light splits
+      if (level === 'Beginner') return 'sample-better-body';
+      if (level === 'Intermediate') return 'sample-advanced-gen-cond-1-3'; // Use day 1 as representation
+      if (level === 'Advanced') return 'sample-ppl-legs'; // Legs/Core tends to be shorter
+    } else if (frequency === '4+' && duration === '45-60') {
+      // Prioritize PPL or heavy splits
+      return (level === 'Advanced') ? 'sample-ppl-push' : 'sample-advanced-gen-cond-1-3';
+    }
+    
+    // Default Fallbacks
+    if (level === 'Beginner') return 'sample-better-body';
+    if (level === 'Intermediate') return 'sample-advanced-gen-cond-1-3';
+    return 'sample-ppl-push';
+  }
+
+  // --- Recommendation Survey Component ---
+  const RecommendationSurvey = () => {
+      const [level, setLevel] = useState('Beginner');
+      const [frequency, setFrequency] = useState('3-4');
+      const [duration, setDuration] = useState('20-30');
+
+      const handleSuggest = () => {
+          const recommendationId = getWorkoutRecommendationId(level, frequency, duration);
+          handleSurveyComplete(recommendationId);
+      };
+
+      return (
+          <Card className='p-6 bg-red-900/50 text-gray-100 space-y-4'>
+              <h3 className="text-xl font-bold text-red-400">Find Your Perfect Routine</h3>
+              <p className='text-sm text-gray-300'>Answer these quick questions for a personalized Bowflex workout suggestion.</p>
+              
+              <div className='space-y-4 pt-2 border-t border-gray-700'>
+                  {/* Question 1: Experience Level */}
+                  <div className='space-y-2'>
+                      <label className='font-semibold'>1. What is your current fitness level?</label>
+                      <select value={level} onChange={(e) => setLevel(e.target.value)}
+                          className='w-full p-2 bg-gray-700 rounded-lg text-white'>
+                          <option value="Beginner">Beginner (New to strength training)</option>
+                          <option value="Intermediate">Intermediate (Consistent, 3-6 months experience)</option>
+                          <option value="Advanced">Advanced (1+ year experience, focused on gains)</option>
+                      </select>
+                  </div>
+
+                  {/* Question 2: Weekly Frequency */}
+                  <div className='space-y-2'>
+                      <label className='font-semibold'>2. How many days per week do you plan to lift?</label>
+                      <select value={frequency} onChange={(e) => setFrequency(e.target.value)}
+                          className='w-full p-2 bg-gray-700 rounded-lg text-white'>
+                          <option value="1-2">1-2 days</option>
+                          <option value="3-4">3-4 days</option>
+                          <option value="4+">4+ days</option>
+                      </select>
+                  </div>
+
+                  {/* Question 3: Session Duration */}
+                  <div className='space-y-2'>
+                      <label className='font-semibold'>3. How long is your typical workout session?</label>
+                      <select value={duration} onChange={(e) => setDuration(e.target.value)}
+                          className='w-full p-2 bg-gray-700 rounded-lg text-white'>
+                          <option value="20-30">20-30 minutes</option>
+                          <option value="45-60">45-60 minutes</option>
+                          <option value="60+">60+ minutes</option>
+                      </select>
+                  </div>
+              </div>
+              
+              <Button onClick={handleSuggest} className='w-full bg-red-600 mt-4'>
+                  Suggest My Workout
+              </Button>
+              <Button onClick={() => setShowSurvey(false)} className='w-full bg-gray-700 text-gray-300 hover:bg-gray-600 mt-2 text-sm'>
+                  Skip to Full List
+              </Button>
+          </Card>
+      );
+  }
+
+  if (status === 'idle') {
+    
+    // Group sample workouts by level
+    const categorizedWorkouts = SAMPLE_WORKOUTS.reduce((acc, w) => {
+        const level = w.level || 'Custom';
+        if (!acc[level]) {
+            acc[level] = [];
+        }
+        acc[level].push(w);
+        return acc;
+    }, { Beginner: [], Intermediate: [], Advanced: [] });
+    
+    // Sort custom workouts separately
+    const customWorkouts = workouts.filter(w => !w.id.startsWith('sample'));
+
+    if (showSurvey) {
+      return (
+        <div className="p-4 space-y-4">
+          <h2 className="text-2xl font-bold text-gray-100 mb-4">Welcome to Revolution Tracker</h2>
+          <RecommendationSurvey />
+          <p className="text-center text-sm text-gray-400">OR view full list below</p>
+        </div>
+      )
+    }
+
+    // After survey or skip
+    return (
+      <div className="p-4 space-y-4">
+        <h2 className="text-2xl font-bold text-gray-100 mb-4">Start a Bowflex Workout</h2>
+        
+        {recommendedWorkout && (
+          <Card className='p-4 bg-green-900/50 border-l-4 border-green-500'>
+              <h3 className="font-bold text-xl text-green-400 mb-2">Recommended for You!</h3>
+              <p className="font-bold text-gray-100">{recommendedWorkout.name}</p>
+              <p className="text-xs text-gray-400 my-1">{recommendedWorkout.description}</p>
+              <Button onClick={() => startWorkout(recommendedWorkout)} className="w-full text-sm bg-green-600 hover:bg-green-700 mt-3 flex items-center justify-center">
+                  <Play size={14} className="mr-1" /> Start This Routine
+              </Button>
+              <Button onClick={() => setRecommendedWorkout(null)} className="w-full text-xs py-1 px-2 bg-gray-700 text-gray-300 hover:bg-gray-600 mt-2 flex items-center justify-center">
+                  View Full List Instead
+              </Button>
+          </Card>
+        )}
+        
+        {/* Custom Workouts List */}
+        {customWorkouts.length > 0 && (
+            <div className="space-y-3">
+              <h3 className="text-xl font-bold text-red-500 border-b border-gray-700 pb-1">Your Custom Routines</h3>
+              {customWorkouts.map(w => (
+                <Card key={w.id} className="p-3 border-l-4 border-red-500">
+                  <div className='flex justify-between items-start mb-2'>
+                    <div>
+                      <p className="font-bold text-gray-100">{w.name}</p>
+                      <p className="text-sm text-gray-400">{w.exercises.length} Exercises</p>
+                    </div>
+                    <div className='flex space-x-2'>
+                        <Button onClick={() => startWorkout(w)} className="text-xs py-1 px-2 bg-red-600 hover:bg-red-700 flex items-center">
+                            <Play size={14} className="mr-1" /> Start
+                        </Button>
+                        <Button onClick={() => duplicateAndEdit(w)} className="text-xs py-1 px-2 bg-gray-600 hover:bg-gray-500 flex items-center">
+                            <List size={14} className="mr-1" /> Edit
+                        </Button>
+                    </div>
+                  </div>
+                </Card>
+              ))}
+            </div>
+        )}
+        
+        {/* Suggested Workouts by Level */}
+        <div className="space-y-3 pt-6 border-t border-gray-700">
+            <h3 className="text-xl font-bold text-green-500 border-b border-gray-700 pb-1">Suggested Routines by Level</h3>
+
+            {Object.entries(categorizedWorkouts).map(([level, workouts]) => (
+                workouts.length > 0 && (
+                    <details key={level} className="bg-gray-800 rounded-xl">
+                        <summary className={`p-4 font-bold text-lg cursor-pointer flex justify-between items-center ${level === 'Beginner' ? 'text-blue-400' : level === 'Intermediate' ? 'text-yellow-400' : 'text-red-400'}`}>
+                            {level}
+                            <span className="text-sm text-gray-400">{workouts.length} Routines</span>
+                        </summary>
+                        <div className="space-y-3 p-4 border-t border-gray-700">
+                            {workouts.map(w => (
+                                <Card key={w.id} className="p-3 border-l-4 border-green-500 bg-gray-900/50">
+                                    <p className="font-bold text-gray-100">{w.name}</p>
+                                    <p className="text-xs text-gray-400 my-1">{w.description}</p>
+                                    <Button onClick={() => startWorkout(w)} className="w-full text-sm bg-green-600 hover:bg-green-700 mt-2 flex items-center justify-center">
+                                        <Play size={14} className="mr-1" /> Start Session
+                                    </Button>
+                                    <Button onClick={() => duplicateAndEdit(w)} className="w-full text-xs py-1 px-2 bg-gray-600 hover:bg-gray-500 flex items-center justify-center mt-2">
+                                        <List size={14} className="mr-1" /> Duplicate & Edit
+                                    </Button>
+                                </Card>
+                            ))}
+                        </div>
+                    </details>
+                )
+            ))}
+        </div>
+        
+        {workouts.length === 0 && SAMPLE_WORKOUTS.length === 0 && (
+            <p className="text-center text-gray-400 italic pt-8">
+              No workouts found. Use the <Dumbbell size={14} className="inline mb-1" /> BUILD tab to create your first Revolution routine.
+            </p>
+          )}
+      </div>
+    );
+  }
+
+  if (status === 'complete') {
+    return (
+      <div className="p-8 text-center flex flex-col items-center bg-gray-900 min-h-screen">
+        <Clock size={48} className="text-green-500 mb-4" />
+        <h2 className="text-3xl font-bold text-green-500">Workout Complete!</h2>
+        <p className="text-gray-300 mt-2">You crushed your **{workout.name}** session.</p>
+        <Button onClick={handleCompleteWorkout} className="bg-red-600 hover:bg-red-700 mt-6 w-full">
+          Finalize & Save Log
+        </Button>
+        <Button onClick={stopWorkout} className="bg-gray-700 hover:bg-gray-600 text-white mt-3 w-full">
+          Cancel & Discard
+        </Button>
+      </div>
+    );
+  }
+
+  // Active Workout View
+  return (
+    <div className="p-4 space-y-4">
+      {showInstructions && (
+          <ExerciseInstructionModal
+              exerciseName={currentLog.name}
+              exerciseConfig={currentLog}
+              onClose={() => setShowInstructions(false)}
+          />
+      )}
+      {showCamera && <CameraMirror onClose={() => setShowCamera(false)} />}
+      
+      <Card className="bg-red-600 text-white p-6">
+        <h2 className="text-2xl font-extrabold">{workout.name}</h2>
+        <p className="text-red-200 mt-1">Exercise {currentExerciseIndex + 1} of {activeLogs.length}</p>
+      </Card>
+
+      {/* Current Exercise Block */}
+      <Card className="border-t-4 border-red-500 p-6">
+        <div className='flex justify-between items-center'>
+            <button onClick={() => setShowInstructions(true)} className='flex items-center text-left hover:text-red-600 text-gray-100 transition-colors'>
+                <h3 className="text-3xl font-bold">{currentLog.name}</h3>
+                <Info size={20} className="ml-2 text-red-500 flex-shrink-0" />
+            </button>
+        </div>
+        
+        <p className="text-red-500 mb-4 text-sm font-medium">
+          Arm Pos: **{currentLog.armPosition}** | Bench: **{currentLog.benchPosition}**
+        </p>
+        
+        {/* Previous Best & Recommendation */}
+        {(prevBest.hasPrevious || nextRecommendation) && (
+            <div className="bg-gray-900 p-3 rounded-lg border border-gray-700 mb-4">
+                {prevBest.hasPrevious && (
+                    <p className="text-xs text-gray-400 font-medium">
+                        Previous Best: {prevBest.reps} Reps @ {displayResistance(prevBest.resistance)} {resistanceUnit}
+                    </p>
+                )}
+                {nextRecommendation && (
+                    <p className={`text-sm mt-1 font-semibold ${nextRecommendation.type === 'success' ? 'text-green-500' : 'text-yellow-500'}`}>
+                        {nextRecommendation.message}
+                    </p>
+                )}
+            </div>
+        )}
+
+        {/* Set Progress */}
+        <div className="flex justify-between items-center mb-4">
+          <p className="text-xl font-semibold text-gray-100">Set {currentSetIndex + 1} of {currentLog.sets.length}</p>
+          <div className="text-sm font-medium text-gray-400">
+            Target: {currentSet.targetReps} Reps @ {displayResistance(currentSet.targetResistance)} {resistanceUnit}
+          </div>
+        </div>
+
+        {/* Input Log Form */}
+        <div className="space-y-3">
+          <div className="flex items-center space-x-2">
+            <Dumbbell size={20} className="text-red-500 flex-shrink-0" />
+            <input
+              id="resistanceInput"
+              type="number"
+              placeholder={`Resistance (${resistanceUnit})`}
+              defaultValue={displayResistance(currentSet.targetResistance)}
+              onChange={(e) => setLogRef.current.resistance = e.target.value}
+              className="w-full p-3 border border-gray-600 bg-gray-700 text-gray-100 rounded-xl"
+              min="1" step={unitSystem === 'metric' ? "2.5" : "5"}
+            />
+          </div>
+          <div className="flex items-center space-x-2">
+            <List size={20} className="text-red-500 flex-shrink-0" />
+            <input
+              id="repsInput"
+              type="number"
+              placeholder="Reps Completed"
+              defaultValue={currentSet.targetReps}
+              onChange={(e) => setLogRef.current.reps = e.target.value}
+              className="w-full p-3 border border-gray-600 bg-gray-700 text-gray-100 rounded-xl"
+              min="1"
+            />
+          </div>
+        </div>
+        
+        <div className='flex space-x-2 mt-6'>
+            <Button onClick={handleLogSet} className="w-2/3 bg-green-500 hover:bg-green-600 text-lg">
+                <Square size={20} className="inline mr-2" /> Log Set & Rest
+            </Button>
+            <Button 
+                onClick={() => setShowCamera(true)} 
+                className="w-1/3 bg-gray-600 hover:bg-gray-500 text-white text-sm flex items-center justify-center"
+            >
+                <Video size={18} className='mr-1' /> Form
+            </Button>
+        </div>
+      </Card>
+      
+      {/* Rest Timer */}
+      <Card className={`text-center p-4 transition-colors ${restTimerActive ? 'bg-red-900/50' : 'bg-gray-700'}`}>
+        <div className="flex justify-center items-center space-x-4">
+          <Clock size={24} className="text-red-500" />
+          <span className="text-3xl font-mono font-bold text-red-500">
+            {restTimeRemaining}s
+          </span>
+        </div>
+        <p className="text-sm text-gray-400 mt-1">Time until next set</p>
+        <div className="flex justify-center space-x-3 mt-3">
+          <IconButton onClick={() => dispatch({ type: 'TOGGLE_REST_TIMER' })} className={`${restTimerActive ? 'bg-red-600 text-white hover:bg-red-700' : 'bg-green-600 text-white hover:bg-green-700'}`}>
+            {restTimerActive ? <Pause size={20} /> : <Play size={20} />}
+          </IconButton>
+          <IconButton onClick={() => dispatch({ type: 'RESET_TIMER' })} className="bg-yellow-600 text-white hover:bg-yellow-700">
+            <RefreshCw size={20} />
+          </IconButton>
+        </div>
+      </Card>
+      
+      <Button onClick={handleCompleteWorkout} className="w-full bg-gray-600 hover:bg-gray-500 text-white text-sm">
+        Finish Session Early
+      </Button>
+    </div>
+  );
+};
+
+// 2.3 History Tab
+const HistoryView = ({ logs, deleteLog, unitSystem }) => {
+  const resistanceUnit = unitSystem === 'metric' ? 'Kg' : 'Lbs';
+  const displayResistance = (val) => convertResistance(val, unitSystem);
+  
+  if (logs.length === 0) {
+    return (
+      <div className="p-8 text-center text-gray-400">
+        <History size={48} className="mx-auto mb-4 text-red-700" />
+        <p className="text-lg">Your workout history is empty.</p>
+        <p className="text-sm mt-1">Log a completed workout to see it here!</p>
+      </div>
+    );
+  }
+
+  const [reviewState, setReviewState] = useState({}); // { logId: { text: string, loading: boolean, error: string } }
+
+  const handleGetReview = async (log) => {
+    const logId = log.id;
+    if (reviewState[logId]?.loading) return;
+
+    setReviewState(prev => ({ ...prev, [logId]: { ...prev[logId], loading: true, error: null } }));
+
+    try {
+      const reviewText = await getPerformanceReview(log, unitSystem);
+      setReviewState(prev => ({ ...prev, [logId]: { text: reviewText, loading: false } }));
+    } catch (e) {
+      setReviewState(prev => ({ ...prev, [logId]: { text: "Failed to generate review. Network or AI error.", loading: false, error: true } }));
+    }
+  };
+
+  return (
+    <div className="p-4 space-y-4">
+      <h2 className="text-2xl font-bold text-gray-100">Workout History</h2>
+      {logs
+        .sort((a, b) => b.logTime.toMillis() - a.logTime.toMillis()) // Sort by latest
+        .map(log => {
+          const logReview = reviewState[log.id];
+          return (
+            <Card key={log.id} className="p-4 border-l-4 border-red-500">
+              <div className="flex justify-between items-start">
+                <div>
+                  <p className="font-bold text-xl text-gray-100">{log.workoutName}</p>
+                  <p className="text-sm text-gray-400 mt-1">
+                    {log.logTime.toDate().toLocaleDateString()} at {log.logTime.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                  </p>
+                  <p className="text-xs text-red-500">{log.durationMinutes} minutes duration</p>
+                </div>
+                <IconButton onClick={() => deleteLog(log.id)} className="text-red-500 bg-red-900/50 hover:bg-red-900">
+                  <Trash2 size={18} />
+                </IconButton>
+              </div>
+              
+              {/* AI Review Button/Display */}
+              <div className="mt-4 border-t border-gray-700 pt-3">
+                  {logReview?.text ? (
+                      <Card className={`p-3 text-sm ${logReview.error ? 'bg-red-900 text-red-300' : 'bg-green-900/50 text-green-300'} border-l-4 border-green-500`}>
+                          <p className='font-bold text-base mb-1 flex items-center'>
+                              <Zap size={14} className='mr-2' /> AI Performance Review:
+                          </p>
+                          <p>{logReview.text}</p>
+                      </Card>
+                  ) : (
+                      <Button 
+                          onClick={() => handleGetReview(log)} 
+                          disabled={logReview?.loading} 
+                          className="w-full text-xs py-2 bg-red-900/60 text-red-400 hover:bg-red-900/80 flex items-center justify-center"
+                      >
+                          {logReview?.loading ? (
+                              <>
+                                  <RefreshCw size={14} className="animate-spin mr-2" /> Generating Review...
+                              </>
+                          ) : (
+                              <>
+                                  <Zap size={14} className="mr-2" /> View AI Review ✨
+                              </>
+                          )}
+                      </Button>
+                  )}
+              </div>
+              
+              <details className="mt-3 border-t border-gray-700 pt-3">
+                <summary className="font-medium text-red-500 cursor-pointer text-sm">View {log.exercisesLogged.length} Exercises Logged</summary>
+                <div className="mt-3 space-y-2 max-h-40 overflow-y-auto">
+                  {log.exercisesLogged.map((ex, index) => {
+                    const totalSets = ex.sets.length;
+                    const totalReps = ex.sets.reduce((sum, set) => sum + set.reps, 0);
+                    const totalResistanceLbs = ex.sets.reduce((sum, set) => sum + set.resistance, 0);
+                    const avgResistance = displayResistance(totalResistanceLbs / totalSets).toFixed(0);
+
+                    return (
+                      <div key={index} className="bg-gray-700 p-2 rounded-lg text-sm">
+                        <p className="font-semibold text-gray-200">{ex.name}</p>
+                        <p className="text-xs text-gray-400">
+                          {totalSets} Sets | {totalReps} Total Reps | Avg. {avgResistance} {resistanceUnit}
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+              </details>
+            </Card>
+          );
+        })}
+    </div>
+  );
+};
+
+// 2.4 Achievements Tab (Now Progress Dashboard)
+const AchievementsView = ({ achievementStats, unitSystem }) => {
+    const { stats, achievements } = achievementStats;
+    const achievedIds = new Set(achievements.map(a => a.id));
+    const sortedGoals = ACHIEVEMENT_GOALS.sort((a, b) => a.category.localeCompare(b.category));
+    
+    const resistanceUnit = unitSystem === 'metric' ? 'Kg' : 'Lbs';
+    const displayResistance = (val) => convertResistance(val, unitSystem);
+    const displayVolume = (val) => Math.round(val * (unitSystem === 'metric' ? 0.000453592 : 0.001)); // Convert Total Volume Lbs*Reps to k-units
+
+    // Group achievements by category
+    const categorizedGoals = sortedGoals.reduce((acc, goal) => {
+        if (!acc[goal.category]) {
+            acc[goal.category] = [];
+        }
+        acc[goal.category].push(goal);
+        return acc;
+    }, {});
+
+    const getAchievedDate = (id) => {
+      const achievement = achievements.find(a => a.id === id);
+      if (achievement && achievement.dateAchieved) {
+        return achievement.dateAchieved.toDate().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      }
+      return '';
+    };
+
+    const GoalProgress = ({ goal }) => {
+        if (goal.category === 'Consistency') {
+            return <p className="text-xs text-gray-400">Current: **{stats.totalWorkouts}** / {goal.description.match(/\d+/)[0]} workouts</p>;
+        }
+        if (goal.category === 'Volume') {
+            const target = parseInt(goal.description.match(/\d+[\d,]* /)[0].replace(/,/g, ''));
+            return <p className="text-xs text-gray-400">Current: **{stats.totalReps.toLocaleString()}** / {target.toLocaleString()} reps</p>;
+        }
+        if (goal.category === 'Strength') {
+            // Note: target weight is defined in Lbs in ACHIEVEMENT_GOALS
+            const targetWeightLbs = parseInt(goal.description.match(/\d+/)[0]);
+            let currentWeightLbs = 0;
+            if (goal.id === 'leg_master') currentWeightLbs = stats.maxLegPress;
+            if (goal.id === 'upper_beast') currentWeightLbs = stats.maxBenchPress;
+            
+            const targetDisplay = displayResistance(targetWeightLbs);
+            const currentDisplay = displayResistance(currentWeightLbs);
+
+            return <p className="text-xs text-gray-400">Current Max: **{currentDisplay}** / {targetDisplay} {resistanceUnit}</p>;
+        }
+        return null;
+    };
+    
+    const StatDisplay = ({ title, value, unit, icon }) => (
+        <Card className="flex flex-col items-center p-3 border-t-2 border-red-500">
+            {icon}
+            <p className="text-2xl font-extrabold text-gray-100 mt-1">{value.toLocaleString()}</p>
+            <p className="text-xs text-red-400 uppercase font-semibold">{title}</p>
+            <p className="text-sm text-gray-500">{unit}</p>
+        </Card>
+    );
+
+    return (
+        <div className="p-4 space-y-6">
+            <Card className='text-center p-6 bg-red-900/50'>
+                <h2 className="text-2xl font-bold text-gray-100">Progress Dashboard</h2>
+                <p className="text-sm text-gray-400 mt-1">Track your growth and milestones here.</p>
+                <div className='grid grid-cols-2 gap-3 mt-4'>
+                    <StatDisplay title="Workouts" value={stats.totalWorkouts} unit="Completed" icon={<Home size={20} className="text-red-500" />} />
+                    <StatDisplay title="Total Volume" value={displayVolume(stats.totalVolume)} unit={`k ${resistanceUnit} Lifted`} icon={<Dumbbell size={20} className="text-red-500" />} />
+                    <StatDisplay title="Max Leg Press" value={displayResistance(stats.maxLegPress)} unit={resistanceUnit} icon={<List size={20} className="text-red-500" />} />
+                    <StatDisplay title="Max Bench" value={displayResistance(stats.maxBenchPress)} unit={resistanceUnit} icon={<List size={20} className="text-red-500" />} />
+                </div>
+            </Card>
+
+            {Object.entries(categorizedGoals).map(([category, goals]) => (
+                <div key={category} className="space-y-3">
+                    <h3 className="text-xl font-bold text-red-500 border-b border-gray-700 pb-1">{category} Goals</h3>
+                    {goals.map(goal => {
+                        const isAchieved = achievedIds.has(goal.id);
+                        return (
+                            <Card key={goal.id} className={`p-4 transition-all ${isAchieved ? 'bg-green-900/50 border-l-4 border-green-500' : 'bg-gray-800 border-l-4 border-gray-700'}`}>
+                                <div className="flex justify-between items-center">
+                                    <div className='flex items-center'>
+                                        <Award size={24} className={isAchieved ? "text-green-400" : "text-gray-500"} />
+                                        <div className='ml-3'>
+                                            <p className={`font-bold ${isAchieved ? 'text-green-400' : 'text-gray-100'}`}>{goal.name}</p>
+                                            <p className="text-sm text-gray-400">{goal.description}</p>
+                                        </div>
+                                    </div>
+                                    <span className={`text-xs font-semibold px-2 py-1 rounded-full ${isAchieved ? 'bg-green-500 text-gray-900' : 'bg-gray-600 text-gray-300'}`}>
+                                        {isAchieved ? getAchievedDate(goal.id) : 'LOCKED'}
+                                    </span>
+                                </div>
+                                {!isAchieved && <GoalProgress goal={goal} />}
+                            </Card>
+                        );
+                    })}
+                </div>
+            ))}
+        </div>
+    );
+};
+
+// 2.5 Settings Tab
+const SettingsView = ({ restTimeSetting, setRestTimeSetting, unitSystem, setUnitSystem }) => {
+    return (
+        <div className="p-4 space-y-6">
+            <Card className='p-6 border-t-4 border-red-500'>
+                <h2 className="text-2xl font-bold text-gray-100 mb-4 flex items-center">
+                    <Settings size={24} className="mr-2 text-red-500" /> App Settings
+                </h2>
+                
+                <div>
+                    <label className="block text-red-500 font-semibold mb-2" htmlFor="rest-time-setting">
+                        Default Rest Time (Seconds)
+                    </label>
+                    <input
+                        id="rest-time-setting"
+                        type="number"
+                        value={restTimeSetting}
+                        onChange={(e) => setRestTimeSetting(Math.max(15, parseInt(e.target.value) || 60))}
+                        min="15"
+                        step="5"
+                        className="w-full p-3 border border-gray-600 bg-gray-700 text-gray-100 rounded-xl text-lg focus:ring-red-500 focus:border-red-500"
+                    />
+                    <p className="text-sm text-gray-400 mt-4">
+                        This time is used for the countdown between sets and exercises. (Min: 15 seconds)
+                    </p>
+                </div>
+            </Card>
+            
+            <Card className='p-6 border-t-4 border-red-500'>
+                <h2 className="text-2xl font-bold text-gray-100 mb-4 flex items-center">
+                    <Ruler size={24} className="mr-2 text-red-500" /> Measurement Units
+                </h2>
+                <div>
+                    <label className="block text-red-500 font-semibold mb-2" htmlFor="unit-system">
+                        Preferred Unit System
+                    </label>
+                    <select
+                        id="unit-system"
+                        value={unitSystem}
+                        onChange={(e) => setUnitSystem(e.target.value)}
+                        className="w-full p-3 border border-gray-600 bg-gray-700 text-gray-100 rounded-xl text-lg focus:ring-red-500 focus:border-red-500"
+                    >
+                        <option value="imperial">Imperial (Lbs, In)</option>
+                        <option value="metric">Metric (Kg, Cm)</option>
+                    </select>
+                    <p className="text-sm text-gray-400 mt-2">
+                        Changing this setting converts all displayed weight and height metrics.
+                    </p>
+                </div>
+            </Card>
+        </div>
+    );
+};
+
+// 2.6 Profile/Progression View
+const ProfileView = ({ profile, weightLogs, saveProfile, saveWeightLog, deleteWeightLog, unitSystem }) => {
+    const [name, setName] = useState(profile.name || '');
+    const [age, setAge] = useState(profile.age || '');
+    const [height, setHeight] = useState(profile.height || '');
+    const [gender, setGender] = useState(profile.gender || 'Male');
+    const [currentWeight, setCurrentWeight] = useState('');
+
+    const currentProfileDocId = profile.id;
+
+    // Unit display setup
+    const isMetric = unitSystem === 'metric';
+    const weightUnit = isMetric ? 'Kg' : 'Lbs';
+    const heightUnit = isMetric ? 'Cm' : 'Inches';
+    const weightConversion = isMetric ? LBS_TO_KG : (val) => val;
+    const inverseWeightConversion = isMetric ? KG_TO_LBS : (val) => val;
+    const heightDisplay = isMetric ? (val) => Math.round(val * 2.54) : (val) => val;
+    const inverseHeightConversion = isMetric ? (val) => Math.round(val / 2.54) : (val) => val;
+
+
+    // Use current profile data for local state initialization
+    useEffect(() => {
+        // When profile data loads, set the local state
+        setName(profile.name || '');
+        setAge(profile.age || '');
+        // Convert stored imperial height to current display unit for the input field
+        setHeight(profile.height ? heightDisplay(profile.height) : '');
+        setGender(profile.gender || 'Male');
+    }, [profile, unitSystem]);
+
+
+    const handleSaveProfile = async () => {
+        if (!name.trim() || !age || !height) return;
+        
+        // Convert displayed height back to Lbs/Inches for consistent storage (Imperial)
+        const storedHeightImperial = inverseHeightConversion(height);
+
+        const profileData = {
+            name: name.trim(),
+            age: parseInt(age) || 0,
+            height: storedHeightImperial, // Store as Imperial (Inches)
+            gender: gender,
+            updatedAt: serverTimestamp(),
+        };
+        try {
+            await saveProfile(profileData, currentProfileDocId);
+            // If the user has a current weight input, log it too
+            if (currentWeight) {
+                await handleLogWeight();
+            }
+        } catch (e) {
+            console.error("Failed to save profile:", e);
+        }
+    };
+
+    const handleLogWeight = async () => {
+        if (!currentWeight) return;
+        
+        // Convert the input weight (which is in current unit) to Lbs for consistent storage
+        const storedWeightImperial = inverseWeightConversion(currentWeight);
+
+        const weightData = {
+            weight: storedWeightImperial, // Store as Imperial (Lbs)
+            timestamp: serverTimestamp(),
+        };
+        try {
+            await saveWeightLog(weightData);
+            setCurrentWeight('');
+        } catch (e) {
+            console.error("Failed to log weight:", e);
+        }
+    };
+
+    // Note: weightLogs stores Lbs, so convert for display
+    const sortedWeightLogs = weightLogs.sort((a, b) => b.timestamp.toMillis() - a.timestamp.toMillis());
+    const latestWeightLbs = sortedWeightLogs[0]?.weight;
+    const initialWeightLbs = weightLogs.length > 0 ? sortedWeightLogs[sortedWeightLogs.length - 1].weight : null;
+    
+    const latestWeightDisplay = latestWeightLbs ? weightConversion(latestWeightLbs) : '--';
+    const initialWeightDisplay = initialWeightLbs ? weightConversion(initialWeightLbs) : null;
+    
+    const weightChange = latestWeightLbs && initialWeightLbs ? latestWeightLbs - initialWeightLbs : 0;
+    const weightChangeDisplay = weightChange ? weightConversion(weightChange) : '--';
+    const weightChangeText = weightChangeDisplay === '--' ? '--' : `${weightChangeDisplay} ${weightUnit}`;
+
+
+    return (
+        <div className="p-4 space-y-6">
+            <Card className='p-6 border-t-4 border-red-500'>
+                <h2 className="text-2xl font-bold text-gray-100 mb-4 flex items-center">
+                    <User size={24} className="mr-2 text-red-500" /> Personal Profile
+                </h2>
+                
+                <div className="space-y-4">
+                    <input
+                        type="text"
+                        value={name}
+                        onChange={(e) => setName(e.target.value)}
+                        placeholder="Name"
+                        className="w-full p-3 border border-gray-600 bg-gray-700 text-gray-100 rounded-xl"
+                    />
+                    <div className="flex space-x-4">
+                        <input
+                            type="number"
+                            value={age}
+                            onChange={(e) => setAge(e.target.value)}
+                            placeholder="Age"
+                            min="1"
+                            className="w-1/3 p-3 border border-gray-600 bg-gray-700 text-gray-100 rounded-xl"
+                        />
+                        <input
+                            type="number"
+                            value={height}
+                            onChange={(e) => setHeight(e.target.value)}
+                            placeholder={`Height (${heightUnit})`}
+                            min="1"
+                            className="w-1/3 p-3 border border-gray-600 bg-gray-700 text-gray-100 rounded-xl"
+                        />
+                        <select
+                            value={gender}
+                            onChange={(e) => setGender(e.target.value)}
+                            className="w-1/3 p-3 border border-gray-600 bg-gray-700 text-gray-100 rounded-xl"
+                        >
+                            <option value="Male">Male</option>
+                            <option value="Female">Female</option>
+                            <option value="Other">Other</option>
+                        </select>
+                    </div>
+                </div>
+                <Button onClick={handleSaveProfile} className="w-full mt-6 bg-red-600">
+                    Save Profile Details
+                </Button>
+            </Card>
+
+            <Card className='p-6 border-t-4 border-green-500'>
+                <h2 className="text-2xl font-bold text-gray-100 mb-4 flex items-center">
+                    <List size={24} className="mr-2 text-green-500" /> Weight Progression
+                </h2>
+
+                <div className='flex justify-between items-center mb-4 p-3 bg-gray-900/50 rounded-xl'>
+                    <div className='text-center'>
+                        <p className="text-xl font-bold text-gray-100">{latestWeightDisplay}</p>
+                        <p className="text-xs text-green-500">Current Weight ({weightUnit})</p>
+                    </div>
+                    <div className='text-center'>
+                        <p className={`text-xl font-bold ${weightChange >= 0 ? 'text-red-500' : 'text-green-500'}`}>
+                           {weightChange > 0 ? `+${weightChangeDisplay}` : weightChangeDisplay || '--'}
+                        </p>
+                        <p className="text-xs text-gray-400">Total Change ({weightUnit})</p>
+                    </div>
+                </div>
+                
+                <div className="flex space-x-2">
+                    <input
+                        type="number"
+                        value={currentWeight}
+                        onChange={(e) => setCurrentWeight(e.target.value)}
+                        placeholder={`Log New Weight (${weightUnit})`}
+                        min="1"
+                        className="w-2/3 p-3 border border-gray-600 bg-gray-700 text-gray-100 rounded-xl"
+                    />
+                    <Button onClick={handleLogWeight} disabled={!currentWeight} className="w-1/3 bg-green-600">
+                        Log
+                    </Button>
+                </div>
+                
+                <details className="mt-4 border-t border-gray-700 pt-3">
+                    <summary className="font-medium text-gray-300 cursor-pointer text-sm">View Weight History ({sortedWeightLogs.length})</summary>
+                    <div className="mt-3 space-y-2 max-h-40 overflow-y-auto">
+                        {sortedWeightLogs.map(log => (
+                            <div key={log.id} className="flex justify-between items-center bg-gray-700 p-2 rounded-lg">
+                                <p className="font-semibold text-gray-100">
+                                    {weightConversion(log.weight)} {weightUnit}
+                                </p>
+                                <p className="text-xs text-gray-400">
+                                    {log.timestamp?.toDate().toLocaleDateString()}
+                                </p>
+                                <IconButton onClick={() => deleteWeightLog(log.id)} className="bg-red-900/50 text-red-400 hover:bg-red-900 p-1">
+                                    <Trash2 size={14} />
+                                </IconButton>
+                            </div>
+                        ))}
+                    </div>
+                </details>
+            </Card>
+        </div>
+    );
+};
+
+
+// --- Main Application Component ---
+const INITIAL_BUILDER_DATA = { name: '', exercises: [], id: null };
+
+const App = () => {
+  const { userId, isAuthReady } = useFirebase();
+  const [activeTab, setActiveTab] = useState('HOME');
+  const [activeWorkoutState, dispatch] = useReducer(workoutReducer, initialWorkoutState);
+  const [builderData, setBuilderData] = useState(INITIAL_BUILDER_DATA);
+  const [restTimeSetting, setRestTimeSetting] = useState(60); // New global rest time state
+  const [unitSystem, setUnitSystem] = useState('imperial'); // New global unit state
+
+  const {
+    data: workouts,
+    loading: workoutsLoading,
+    saveDocument: saveWorkout,
+    deleteDocument: deleteWorkout,
+  } = useFirestoreCollection('custom_workouts');
+
+  const {
+    data: logs,
+    loading: logsLoading,
+    saveDocument: saveLog,
+    deleteDocument: deleteLog,
+  } = useFirestoreCollection('workout_logs');
+
+  const {
+    data: achievements,
+    loading: achievementsLoading,
+    saveDocument: saveAchievement,
+  } = useFirestoreCollection('user_achievements');
+  
+  // Profile Data: stored as a single document with ID 'main_profile'
+  const {
+    data: profileDocs,
+    loading: profileLoading,
+    saveDocument: saveProfile,
+  } = useFirestoreCollection('user_profile');
+  const profile = profileDocs.find(doc => doc.id === 'main_profile') || { id: 'main_profile' };
+
+  // Weight Progression Logs
+  const {
+    data: weightLogs,
+    loading: weightLogsLoading,
+    saveDocument: saveWeightLog,
+    deleteDocument: deleteWeightLog,
+  } = useFirestoreCollection('weight_logs');
+
+
+  const achievementStats = useAchievementStats(logs, achievements, saveAchievement);
+
+
+  const startWorkout = (workout) => {
+    // Pass the current rest time setting into the dispatch payload
+    // Note: The logic below dispatches twice, but only the second one is used due to immediate state update. 
+    // We should simplify the dispatch logic to ensure 'startTime' is correctly set.
+    const initialLogs = workout.exercises.map((ex, index) => ({
+      ...ex,
+      sets: ex.sets,
+      startTime: Date.now() 
+    }));
+    
+    dispatch({ 
+        type: 'START_WORKOUT', 
+        payload: { 
+            ...workout, 
+            exercises: initialLogs, 
+            restTimeSetting: restTimeSetting 
+        } 
+    });
+    
+    setActiveTab('HOME'); // Stay on HOME, which renders the logger
+  };
+
+  const stopWorkout = () => {
+    dispatch({ type: 'STOP_WORKOUT' });
+    setBuilderData(INITIAL_BUILDER_DATA); // Reset builder state on workout stop
+  };
+
+  const duplicateAndEdit = (workout) => {
+      // 1. Create a deep copy of the exercises to ensure Firestore TimeStamp objects are not corrupted
+      const exercisesCopy = JSON.parse(JSON.stringify(workout.exercises));
+      
+      // 2. Prepare the data for the builder component
+      setBuilderData({
+          name: `Copy of ${workout.name}`,
+          exercises: exercisesCopy.map(ex => ({
+              ...ex,
+              // Ensure custom properties default safely for editing
+              armPosition: ex.armPosition || 'Varies',
+              benchPosition: ex.benchPosition || 'Varies',
+          })),
+          id: null, // New document, no ID
+      });
+      
+      // 3. Switch to the BUILD tab
+      setActiveTab('BUILD');
+  };
+
+  const resetInitialData = () => {
+      setBuilderData(INITIAL_BUILDER_DATA);
+  };
+  
+  const renderContent = () => {
+    if (!isAuthReady || workoutsLoading || logsLoading || achievementsLoading || profileLoading || weightLogsLoading) {
+      return (
+        <div className="flex flex-col items-center justify-center h-full p-8 text-red-500">
+          <RefreshCw size={32} className="animate-spin" />
+          <p className="mt-4 font-medium">Loading Revolution Data...</p>
+        </div>
+      );
+    }
+
+    if (activeTab === 'HOME') {
+      return (
+        <WorkoutLogger
+          workouts={workouts}
+          logs={logs}
+          startWorkout={startWorkout}
+          stopWorkout={stopWorkout}
+          activeWorkoutState={activeWorkoutState}
+          dispatch={dispatch}
+          saveLog={saveLog}
+          duplicateAndEdit={duplicateAndEdit}
+          restTimeSetting={restTimeSetting} // Pass setting to logger
+          unitSystem={unitSystem}
+        />
+      );
+    }
+    if (activeTab === 'BUILD') {
+      return (
+        <WorkoutBuilder
+          workouts={workouts}
+          saveWorkout={saveWorkout}
+          deleteWorkout={deleteWorkout}
+          initialData={builderData}
+          resetInitialData={resetInitialData}
+          unitSystem={unitSystem}
+        />
+      );
+    }
+    if (activeTab === 'HISTORY') {
+      return (
+        <HistoryView
+          logs={logs}
+          deleteLog={deleteLog}
+          unitSystem={unitSystem}
+        />
+      );
+    }
+    if (activeTab === 'ACHIEVEMENTS') {
+        return (
+            <AchievementsView 
+              achievementStats={achievementStats} 
+              unitSystem={unitSystem}
+            />
+        );
+    }
+    if (activeTab === 'SETTINGS') {
+        return (
+            <SettingsView 
+                restTimeSetting={restTimeSetting} 
+                setRestTimeSetting={setRestTimeSetting} 
+                unitSystem={unitSystem}
+                setUnitSystem={setUnitSystem}
+            />
+        );
+    }
+    if (activeTab === 'PROFILE') {
+        return (
+            <ProfileView
+                profile={profile}
+                weightLogs={weightLogs}
+                saveProfile={(data) => saveProfile(data, 'main_profile')}
+                saveWeightLog={saveWeightLog}
+                deleteWeightLog={deleteWeightLog}
+                unitSystem={unitSystem}
+            />
+        );
+    }
+    return null;
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-900 flex flex-col font-sans">
+      <header className="bg-gray-800 shadow-lg p-4 sticky top-0 z-10">
+        <div className="flex items-center justify-between">
+          <h1 className="text-2xl font-black text-red-500 tracking-tight">
+            Revolution Tracker
+          </h1>
+          <div className="text-xs text-gray-400">
+            User ID: <span className="font-mono text-gray-200 text-sm">{userId}</span>
+          </div>
+        </div>
+      </header>
+
+      <main className="flex-grow pb-20">
+        {renderContent()}
+      </main>
+
+      {/* Mobile Navigation Bar */}
+      <nav className="fixed bottom-0 left-0 right-0 bg-gray-800 border-t border-gray-700 shadow-2xl z-20">
+        <div className="flex justify-around items-center h-16 max-w-lg mx-auto">
+          {[{ id: 'HOME', icon: Home, label: 'Workout' }, 
+            { id: 'BUILD', icon: Dumbbell, label: 'Build' }, 
+            { id: 'HISTORY', icon: History, label: 'History' },
+            { id: 'ACHIEVEMENTS', icon: Award, label: 'Goals' },
+            { id: 'PROFILE', icon: User, label: 'Profile' }, // New Profile Tab
+            { id: 'SETTINGS', icon: Settings, label: 'Settings' } 
+          ].map(item => (
+            <button
+              key={item.id}
+              onClick={() => setActiveTab(item.id)}
+              className={`flex flex-col items-center justify-center p-2 transition-colors ${activeTab === item.id ? 'text-red-500' : 'text-gray-400 hover:text-red-500'}`}
+              disabled={activeWorkoutState.status === 'active' && item.id !== 'HOME'}
+            >
+              <item.icon size={24} />
+              <span className="text-xs font-medium mt-1">{item.label}</span>
+            </button>
+          ))}
+        </div>
+      </nav>
+    </div>
+  );
+};
+
+// Wrapper for Firebase Context
+const AppWrapper = () => (
+  <FirebaseProvider>
+    <App />
+  </FirebaseProvider>
+);
+
+export default AppWrapper;
